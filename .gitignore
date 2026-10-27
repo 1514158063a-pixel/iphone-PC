@@ -1,0 +1,10 @@
+/outputs/
+/release/
+/work/
+*.lnk
+*.log
+*.pdb
+*.user
+.env
+.env.*
+!.env.example

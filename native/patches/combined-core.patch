@@ -1,0 +1,2244 @@
+diff --git a/lib/compat.h b/lib/compat.h
+index 4ccfb02..5cf40e7 100644
+--- a/lib/compat.h
++++ b/lib/compat.h
+@@ -16,7 +16,14 @@
+ #define COMPAT_H
+ 
+ #if defined(WIN32)
++#ifndef WIN32_LEAN_AND_MEAN
++ #define WIN32_LEAN_AND_MEAN
++#endif
++#include <winsock2.h>
+ #include <ws2tcpip.h>
++#include <mstcpip.h>
++#include <iphlpapi.h>
++#include <mswsock.h>
+ #include <windows.h>
+ #ifndef snprintf
+ #define snprintf _snprintf
+@@ -27,6 +34,7 @@
+ #include <sys/ioctl.h>
+ #include <sys/time.h>
+ #include <netinet/in.h>
++#include <netinet/tcp.h>
+ #include <arpa/inet.h>
+ #include <unistd.h>
+ #include <errno.h>
+diff --git a/lib/media_clock.c b/lib/media_clock.c
+new file mode 100644
+index 0000000..6268cc2
+--- /dev/null
++++ b/lib/media_clock.c
+@@ -0,0 +1,41 @@
++/* Shared audio/video presentation mapping. SPDX-License-Identifier: GPL-3.0-or-later */
++#include "media_clock.h"
++#include <stdbool.h>
++#include <pthread.h>
++
++static pthread_mutex_t mapping_mutex = PTHREAD_MUTEX_INITIALIZER;
++static bool have_fallback = false;
++static uint64_t fallback_offset = 0;
++static uint64_t presentation_adjustment = 0;
++
++uint64_t media_clock_map(uint64_t remote_ns, uint64_t ntp_local_ns, uint64_t fallback_local_now_ns) {
++    pthread_mutex_lock(&mapping_mutex);
++    uint64_t mapped;
++    if (ntp_local_ns) {
++        mapped = ntp_local_ns;
++    } else {
++        if (!have_fallback) {
++            /* Unsigned subtraction/addition preserves signed offsets modulo 2^64. */
++            fallback_offset = fallback_local_now_ns - remote_ns;
++            have_fallback = true;
++        }
++        mapped = remote_ns + fallback_offset;
++    }
++    mapped += presentation_adjustment;
++    pthread_mutex_unlock(&mapping_mutex);
++    return mapped;
++}
++
++void media_clock_adjust(uint64_t presentation_delta_ns) {
++    pthread_mutex_lock(&mapping_mutex);
++    presentation_adjustment += presentation_delta_ns;
++    pthread_mutex_unlock(&mapping_mutex);
++}
++
++void media_clock_reset(void) {
++    pthread_mutex_lock(&mapping_mutex);
++    have_fallback = false;
++    fallback_offset = 0;
++    presentation_adjustment = 0;
++    pthread_mutex_unlock(&mapping_mutex);
++}
+diff --git a/lib/media_clock.h b/lib/media_clock.h
+new file mode 100644
+index 0000000..3507dd5
+--- /dev/null
++++ b/lib/media_clock.h
+@@ -0,0 +1,15 @@
++/* Shared audio/video presentation mapping. SPDX-License-Identifier: GPL-3.0-or-later */
++#ifndef UXPLAY_MEDIA_CLOCK_H
++#define UXPLAY_MEDIA_CLOCK_H
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++/* ntp_local_ns == 0 means no validated timing sample is available yet. */
++uint64_t media_clock_map(uint64_t remote_ns, uint64_t ntp_local_ns, uint64_t fallback_local_now_ns);
++void media_clock_adjust(uint64_t presentation_delta_ns);
++void media_clock_reset(void);
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/lib/raop.c b/lib/raop.c
+index 7098fae..fbbb432 100644
+--- a/lib/raop.c
++++ b/lib/raop.c
+@@ -584,6 +584,9 @@ raop_t *
+ raop_init(raop_callbacks_t *callbacks) {
+     assert(callbacks);
+ 
++    /* The Windows wrapper starts the core as a library, rather than upstream main(). */
++    raop_ntp_global_init();
++
+     /* Initialize the network */
+     if (netutils_init() < 0) {
+         return NULL;
+diff --git a/lib/raop_buffer.c b/lib/raop_buffer.c
+index 45a3e4c..2d436e9 100644
+--- a/lib/raop_buffer.c
++++ b/lib/raop_buffer.c
+@@ -173,7 +173,7 @@ raop_buffer_enqueue(raop_buffer_t *raop_buffer, unsigned char *data, unsigned sh
+         return -1;
+     }
+     /* before time is synchronized, some empty data packets are sent */
+-    if (datalen == 12 || (datalen == 16 && !memcmp(&data[12], empty_packet_marker, 4))) {
++    if (datalen == 12) {
+         return 0;
+     }
+     int payload_size = datalen - 12;
+@@ -209,9 +209,14 @@ raop_buffer_enqueue(raop_buffer_t *raop_buffer, unsigned char *data, unsigned sh
+     entry->filled = 1;
+ 
+     entry->payload_data = malloc(payload_size);
+-    int decrypt_ret = raop_buffer_decrypt(raop_buffer, data, entry->payload_data, payload_size, &entry->payload_size);
+-    assert(decrypt_ret >= 0);
+-    assert((int) entry->payload_size <= payload_size);
++    if (datalen == 16 && !memcmp(&data[12], empty_packet_marker, 4)) {
++        memcpy(entry->payload_data, &data[12], payload_size);
++        entry->payload_size = payload_size;
++    } else {
++        int decrypt_ret = raop_buffer_decrypt(raop_buffer, data, entry->payload_data, payload_size, &entry->payload_size);
++        assert(decrypt_ret >= 0);
++        assert((int) entry->payload_size <= payload_size);
++    }
+ 
+     /* Update the raop_buffer seqnums */
+     if (raop_buffer->is_empty) {
+diff --git a/lib/raop_ntp.c b/lib/raop_ntp.c
+index 7da009d..59296f2 100644
+--- a/lib/raop_ntp.c
++++ b/lib/raop_ntp.c
+@@ -24,11 +24,7 @@
+ #include <string.h>
+ #include <stdbool.h>
+ #include <errno.h>
+-#ifdef _WIN32
+-#define CAST (char *)
+-#else
+-#define CAST
+-#endif
++#include <inttypes.h>
+ 
+ #include "raop.h"
+ #include "threads.h"
+@@ -37,41 +33,57 @@
+ #include "byteutils.h"
+ #include "utils.h"
+ 
+-#define SECOND_IN_NSECS 1000000000UL
++#define USEC_IN_NSECS   1000ULL
++#define MSEC_IN_NSECS   1000000ULL
++#define SECOND_IN_NSECS 1000000000ULL
++#define SECOND_IN_USECS 1000000ULL
++
++#define LINESIZE 120
++
+ #define RAOP_NTP_DATA_COUNT   8
+-#define RAOP_NTP_PHI_PPM   15ull                   // PPM
+-#define RAOP_NTP_R_RHO   ((1ull    << 32) / 1000u) // packet precision
+-#define RAOP_NTP_S_RHO   ((1ull    << 32) / 1000u) // system clock precision
+-#define RAOP_NTP_MAX_DIST ((1500ull << 32) / 1000u) // maximum allowed distance
+-#define RAOP_NTP_MAX_DISP ((16ull   << 32))         // maximum dispersion
++#define RAOP_NTP_PHI_PPM   15e-6                   // 15 PPM
++#define RAOP_NTP_R_RHO     0.001                   // packet precision  1ms
++#define RAOP_NTP_S_RHO     0.001                   // system clock precision  1ms
++#define RAOP_NTP_MAX_DIST  1.5                     // maximum allowed distance  1.5 secs
++#define RAOP_NTP_MAX_DISP  16.0                    // maximum dispersion    16 secs.
++#define RAOP_NTP_ALPHA     0.05                    // smoothing parameter  0.05
+ 
+ #define RAOP_NTP_CLOCK_BASE (2208988800ull << 32)
+ 
+ typedef struct raop_ntp_data_s {
+-    uint64_t time; // The local wall clock time at time of ntp packet arrival
+-    uint64_t dispersion;
+-    int64_t delay; // The round trip delay
+-    int64_t offset; // The difference between remote and local wall clock time
++    q32_32_t time; // The T4 timestamp  at time of ntp packet arrival
++    double dispersion;
++    double delay; // The round trip delay
++    double offset; // The difference between (adjusted) remote and local wall clock time
++    q32_32_t t1_sent;
++    q32_32_t t3_recv;
+ } raop_ntp_data_t;
+ 
+ struct raop_ntp_s {
+     logger_t *logger;
+     raop_callbacks_t callbacks;
+-
+     thread_handle_t thread;
+     mutex_handle_t run_mutex;
+-
++    cond_handle_t stopped_cond;
+     mutex_handle_t wait_mutex;
+     cond_handle_t wait_cond;
+ 
+     raop_ntp_data_t data[RAOP_NTP_DATA_COUNT];
+     int data_index;
+ 
++    bool have_fixed_offset;
++    q32_32_t fixed_offset;   // stored in Q32_32 fixed-point format
++
+     // The clock sync params are periodically updated to the AirPlay client's NTP clock
+     mutex_handle_t sync_params_mutex;
+     int64_t sync_offset;
+-    int64_t sync_dispersion;
+-    int64_t sync_delay;
++    bool is_synced;
++    double sync_delay;
++    uint64_t root_distance;
++    bool kernel_timestamp_inconsistency_detected;
++    uint64_t last_detection_time;
++
++    kernel_timestamp_session_t *ntp_session;
+ 
+     // Socket address of the AirPlay client
+     struct sockaddr_storage remote_saddr;
+@@ -83,6 +95,11 @@ struct raop_ntp_s {
+     // The local port of the NTP client on the AirPlay server
+     unsigned short timing_lport;
+ 
++    timing_protocol_t time_protocol;
++    bool client_time_received;
++
++    uint64_t video_arrival_offset;
++
+     /* MUTEX LOCKED VARIABLES START */
+     /* These variables only edited mutex locked */
+     int running;
+@@ -90,12 +107,289 @@ struct raop_ntp_s {
+ 
+     // UDP socket
+     int tsock;
++};
+ 
+-    timing_protocol_t time_protocol;
+-    bool client_time_received;
++/* code for recv with kernel timestamp */
+ 
+-    uint64_t video_arrival_offset;
+-};
++#ifdef _WIN32
++#ifndef WSA_CMSG_SPACE
++#define WSA_CMSG_SPACE(len) (sizeof(struct cmsghdr) + (len))
++#endif
++static LARGE_INTEGER g_system_qpc_frequency =  {0};
++static pthread_once_t g_ntp_clock_once = PTHREAD_ONCE_INIT;
++static void initialize_ntp_clock(void) {
++    QueryPerformanceFrequency(&g_system_qpc_frequency);
++}
++#endif
++
++// Helper to calculate signed difference between two Q32.32 time stamps
++double ntp_diff_to_seconds(q32_32_t ntp_end, q32_32_t ntp_start) {
++    int64_t signed_diff = (int64_t)(ntp_end - ntp_start);
++    return (double)signed_diff / 4294967296.0;
++}
++
++static double ntp_filter_weight(unsigned int index) {
++    return index < RAOP_NTP_DATA_COUNT ? 1.0 / (double) (1U << (index + 1U)) : 0.0;
++}
++
++#ifdef UXPLAY_NTP_LIFECYCLE_TESTS
++double raop_ntp_test_filter_weight(unsigned int index) {
++    return ntp_filter_weight(index);
++}
++#endif
++
++
++void raop_ntp_global_init(void) {
++#ifdef _WIN32
++    pthread_once(&g_ntp_clock_once, initialize_ntp_clock);
++#endif
++}
++
++static void report_timestamp_mode(kernel_timestamp_session_t *session, int mode) {
++    if (session->timestamp_mode_reported != mode) {
++        logger_log(session->raop_ntp->logger, LOGGER_INFO,
++                   "clock receive mode: socket=%d source=%s", session->sock_fd,
++                   mode == 1 ? "kernel-timestamp" : "userspace-clock-fallback");
++        session->timestamp_mode_reported = mode;
++    }
++}
++
++
++kernel_timestamp_session_t* kernel_timestamp_session_create(raop_ntp_t *raop_ntp, int sock_fd) {
++    kernel_timestamp_session_t *session = (kernel_timestamp_session_t*) calloc(1, sizeof(kernel_timestamp_session_t));
++    if (!session) {
++        return NULL;
++    }
++    session->raop_ntp = raop_ntp;
++    session->sock_fd = sock_fd;
++#if defined(_WIN32)
++    raop_ntp_global_init();
++    session->qpc_frequency = g_system_qpc_frequency.QuadPart;
++    session ->pWSARecvMsg_ptr = NULL;
++    // Anchor this session's QPC baseline immediately at creation
++    LARGE_INTEGER qpc_start;
++    QueryPerformanceCounter(&qpc_start);
++    session->base_qpc_ticks = qpc_start.QuadPart;
++    FILETIME ft;
++    GetSystemTimeAsFileTime(&ft);
++    uint64_t windows_ticks = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
++    session->base_system_time_us = (windows_ticks - 116444736000000000ULL) / 10ULL;
++#if defined(SIO_TIMESTAMPING)  //UCRT64 only, not available on MINGW64
++    if (session->qpc_frequency > 0) {
++
++        /* The NetAdapter must  be enabled for Software "RxAll" Timestamping   */
++        SOCKET wsock = (SOCKET)sock_fd;
++        GUID guid = WSAID_WSARECVMSG;
++        DWORD bytes = 0;
++        LPFN_WSARECVMSG local_pWSARecvMsg = NULL;
++
++        if (WSAIoctl(wsock, SIO_GET_EXTENSION_FUNCTION_POINTER, &guid, sizeof(guid),
++                     &local_pWSARecvMsg, sizeof(local_pWSARecvMsg), &bytes, NULL, NULL) == SOCKET_ERROR) {
++            int sock_err = SOCKET_GET_ERROR();
++	    logger_log(session->raop_ntp->logger, LOGGER_ERR, "Not enabling kernel timestamps due to socket error %d:%s",
++                           sock_err, SOCKET_ERROR_STRING(sock_err));
++        } else {
++            session->pWSARecvMsg_ptr = (void*)local_pWSARecvMsg;
++
++            TIMESTAMPING_CONFIG config = { .Flags = TIMESTAMPING_FLAG_RX };
++            DWORD bytes_returned = 0;
++            int rc = WSAIoctl(wsock, SIO_TIMESTAMPING, &config, sizeof(config), NULL, 0, &bytes_returned, NULL, NULL);
++            if (rc == SOCKET_ERROR) {
++                int sock_err = SOCKET_GET_ERROR();
++                 if (sock_err) {
++                    session->pWSARecvMsg_ptr = NULL;
++                    switch (sock_err) {
++                    case 10045:
++                        logger_log(session->raop_ntp->logger, LOGGER_DEBUG, "Socket error %d: no Windows support for kernel timestamps on this socket's NetAdapater", sock_err);
++                        break;
++                    default:
++                        logger_log(session->raop_ntp->logger, LOGGER_ERR, " kernel timestamps were not initialized due to socket error %d:%s",
++                                   sock_err, SOCKET_ERROR_STRING(sock_err));
++                        break;
++                    }
++                }
++            } else {
++                int optval = 1;
++                setsockopt(wsock, IPPROTO_IP, IP_PKTINFO, (char*)&optval, sizeof(optval));
++                setsockopt(wsock, IPPROTO_IPV6, IPV6_PKTINFO, (char*)&optval, sizeof(optval));
++            }
++        }
++    }
++#endif
++#else
++    // Non-Wndows POSIX path   (note: could instead use SO_TIMESTAMP_MONOTONIC on macOS)
++    {
++        int enable_ts = 1;
++        setsockopt(sock_fd, SOL_SOCKET, SO_TIMESTAMP, (const char*)&enable_ts, sizeof(enable_ts));
++    }
++#endif
++    return session;
++}
++
++ssize_t kernel_timestamp_session_recv(kernel_timestamp_session_t *session, char *buf, size_t buf_len,
++                                      void *src_addr, int *addrlen, uint64_t *recv_time_kernel, uint64_t *recv_time_clock) {
++    if (!session || !buf || buf_len == 0) return -1;
++
++    if (recv_time_kernel && recv_time_clock) {
++        *recv_time_kernel = 0;
++        *recv_time_clock = 0;
++#ifdef _WIN32
++#if defined(SIO_TIMESTAMPING) //not defined in legacy MSVCRT systems such as MSYS2 MINGW64
++        if (session->pWSARecvMsg_ptr) {
++            LPFN_WSARECVMSG pWSARecvMsg = (LPFN_WSARECVMSG) session->pWSARecvMsg_ptr;
++            if (pWSARecvMsg != NULL) {
++                // Union forces strict compiler alignment bounds for Windows control frames
++                union {
++                    char buf[WSA_CMSG_SPACE(sizeof(UINT64)) + WSA_CMSG_SPACE(sizeof(IN6_PKTINFO))];
++                    struct cmsghdr align;
++                } control_un;
++
++                struct sockaddr_storage win_remote_addr = {0};
++                INT win_addr_len = sizeof(win_remote_addr);
++
++                WSABUF wsa_buf = {
++                    .len = (ULONG)buf_len,
++                    .buf = buf
++                };
++
++                WSAMSG wsa_msg = {
++                    .name = (LPSOCKADDR)&win_remote_addr,
++                    .namelen = win_addr_len,
++                    .lpBuffers = &wsa_buf,
++                    .dwBufferCount = 1,
++                    .Control.len = sizeof(control_un.buf),
++                    .Control.buf = control_un.buf
++                };
++
++                DWORD bytes_received = 0;
++
++                if (pWSARecvMsg((SOCKET)session->sock_fd, &wsa_msg, &bytes_received, NULL, NULL) != SOCKET_ERROR) {
++                    LARGE_INTEGER qpc_now;
++                    int64_t default_elapsed_ticks;
++                    PCMSGHDR cmsg;
++
++                    QueryPerformanceCounter(&qpc_now);
++                    default_elapsed_ticks  = qpc_now.QuadPart - session->base_qpc_ticks;
++                    *recv_time_clock = (session->base_system_time_us + ((default_elapsed_ticks * 1000000LL) / session->qpc_frequency)) * USEC_IN_NSECS ;
++
++                    for (cmsg = WSA_CMSG_FIRSTHDR(&wsa_msg); cmsg != NULL; cmsg = WSA_CMSG_NXTHDR(&wsa_msg, cmsg)) {
++                        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_TIMESTAMP) {
++                            UINT64 packet_qpc_ticks = *(UINT64*) WSA_CMSG_DATA(cmsg);
++                            if (packet_qpc_ticks > (UINT64) session->base_qpc_ticks) {
++                                int64_t packet_elapsed_ticks = (int64_t) packet_qpc_ticks - session->base_qpc_ticks;
++                                *recv_time_kernel = (session->base_system_time_us + ((packet_elapsed_ticks * 1000000LL) / session->qpc_frequency)) * USEC_IN_NSECS;
++                            }
++                        }
++                    }
++
++                    if (*recv_time_kernel == 0) {
++                        session->pWSARecvMsg_ptr = NULL;
++                    }
++                    report_timestamp_mode(session, *recv_time_kernel ? 1 : 2);
++
++                    if (src_addr && addrlen) {
++                        int copy_len = (wsa_msg.namelen < *addrlen) ? wsa_msg.namelen : *addrlen;
++                        memcpy(src_addr, wsa_msg.name, copy_len);
++                        *addrlen = wsa_msg.namelen;
++                    }
++
++                    return (ssize_t) bytes_received;
++                }
++
++                int sock_err = SOCKET_GET_ERROR();
++                switch (sock_err) {
++                case WSAETIMEDOUT:
++                case WSAECONNRESET:
++                case WSAENETRESET:
++                case WSAECONNABORTED:
++                    return -1; //Routine network exceptions, exit directly
++                default:
++                    //Unexpected for correctly opened-socket, treat as permanent failure and use fallback
++                    logger_log(session->raop_ntp->logger, LOGGER_ERR, "Disabling kernel timestamps due to socket error %d:%s",
++                               sock_err, SOCKET_ERROR_STRING(sock_err));
++                    session->pWSARecvMsg_ptr = NULL;
++                    break;
++                }
++            }
++        }
++#endif
++#else // non-Windows POSIX path
++        struct sockaddr_storage remote_addr = {0};
++        struct iovec iov = { .iov_base = buf, .iov_len = buf_len };
++
++        // Allocate a union to guarantee strict alignment requirements for the buffer
++        union {
++            char buf[CMSG_SPACE(sizeof(struct timeval)) + 64];
++            struct cmsghdr align;
++        } control_un;
++
++        struct msghdr msg = {
++            .msg_name = &remote_addr,
++            .msg_namelen = sizeof(remote_addr),
++            .msg_iov = &iov,
++            .msg_iovlen = 1,
++            .msg_control = control_un.buf,
++            .msg_controllen = sizeof(control_un.buf)
++        };
++
++        ssize_t n = recvmsg(session->sock_fd, &msg, 0);
++        if (n < 0) {
++            return n;
++        }
++
++        // immediate fallback time
++        *recv_time_clock = raop_ntp_get_local_time();
++
++        if (!(msg.msg_flags & MSG_CTRUNC)) {
++            struct cmsghdr *cmsg;
++            for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
++                if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_TIMESTAMP) {
++                    struct timeval *tv_kernel = (struct timeval *)CMSG_DATA(cmsg);
++                    *recv_time_kernel = ((uint64_t)tv_kernel->tv_sec * SECOND_IN_NSECS) + (uint64_t)tv_kernel->tv_usec * USEC_IN_NSECS;
++                    break;
++                }
++            }
++        }
++
++        if (src_addr && addrlen) {
++            int copy_len = ((int)msg.msg_namelen < *addrlen) ? (int)msg.msg_namelen : *addrlen;
++            memcpy(src_addr, msg.msg_name, copy_len);
++            *addrlen = (int)msg.msg_namelen;
++        }
++
++        return n;
++#endif
++    }
++    //Fallback path if kernel timestamp could not be extracted; also used on MINGW64 systems or if recv_time_kernel == NULL
++
++    struct sockaddr *saddr = NULL;
++    socklen_t *saddrlen = NULL;
++    if (src_addr && addrlen) {
++        saddr = (struct sockaddr *) src_addr;
++        saddrlen = (socklen_t *) addrlen;
++    }
++
++#ifdef _WIN32
++    int n = recvfrom(session->sock_fd, buf, (int) buf_len, 0, saddr, saddrlen);
++#else
++    ssize_t n = recvfrom(session->sock_fd, buf, buf_len, 0, saddr, saddrlen);
++#endif
++    if (recv_time_clock) {
++        *recv_time_clock = 0;
++        if ( n >= 0) {
++            *recv_time_clock = raop_ntp_get_local_time();
++            report_timestamp_mode(session, 2);
++        }
++    }
++    return (ssize_t) n;
++}
++
++void kernel_timestamp_session_destroy(kernel_timestamp_session_t *ntp_session) {
++    if (ntp_session) {
++        CLOSESOCKET(ntp_session->sock_fd);
++        free(ntp_session);
++    }
++}
+ 
+ /* for use in syncing audio before a first rtp_sync */
+ void raop_ntp_set_video_arrival_offset(raop_ntp_t* raop_ntp, const uint64_t *offset) {
+@@ -157,9 +451,13 @@ raop_ntp_t *raop_ntp_init(logger_t *logger, raop_callbacks_t *callbacks, const c
+     }
+     raop_ntp->time_protocol = *time_protocol;
+     raop_ntp->logger = logger;
+-    memcpy(&raop_ntp->callbacks, callbacks, sizeof(raop_callbacks_t));    
++    memcpy(&raop_ntp->callbacks, callbacks, sizeof(raop_callbacks_t));
+     raop_ntp->timing_rport = timing_rport;
+     raop_ntp->client_time_received = false;
++    raop_ntp->have_fixed_offset = false;
++    raop_ntp->fixed_offset = 0ull;
++    raop_ntp->kernel_timestamp_inconsistency_detected = false;
++    raop_ntp->last_detection_time = 0ull;
+ 
+     raop_ntp->video_arrival_offset = 0;
+ 
+@@ -173,24 +471,28 @@ raop_ntp_t *raop_ntp_init(logger_t *logger, raop_callbacks_t *callbacks, const c
+ 
+     raop_ntp->running = 0;
+     raop_ntp->joined = 1;
++    raop_ntp->tsock = -1;
+ 
+-    uint64_t time = raop_ntp_get_local_time();
+-
++    raop_ntp->data_index = 0;
+     for (int i = 0; i < RAOP_NTP_DATA_COUNT; ++i) {
+         raop_ntp->data[i].offset     = 0ll;
+         raop_ntp->data[i].delay      = RAOP_NTP_MAX_DISP;
+         raop_ntp->data[i].dispersion = RAOP_NTP_MAX_DISP;
+-        raop_ntp->data[i].time      = time;
++        raop_ntp->data[i].time      = 0ull;
++        raop_ntp->data[i].t1_sent   = 0ull;
++        raop_ntp->data[i].t3_recv   = 0ull;
+     }
+ 
+-    raop_ntp->sync_delay = 0;
+-    raop_ntp->sync_dispersion = 0;
++
++    raop_ntp->is_synced = false;
+     raop_ntp->sync_offset = 0;
+ 
+     MUTEX_CREATE(raop_ntp->run_mutex);
++    COND_CREATE(raop_ntp->stopped_cond);
+     MUTEX_CREATE(raop_ntp->wait_mutex);
+     COND_CREATE(raop_ntp->wait_cond);
+     MUTEX_CREATE(raop_ntp->sync_params_mutex);
++    logger_log(logger, LOGGER_INFO, "ntp lifecycle created: protocol=%d statistics=double-seconds", *time_protocol);
+     return raop_ntp;
+ }
+ 
+@@ -199,6 +501,11 @@ raop_ntp_destroy(raop_ntp_t *raop_ntp)
+ {
+     if (raop_ntp) {
+         raop_ntp_stop(raop_ntp);
++        MUTEX_LOCK(raop_ntp->run_mutex);
++        int stopped = raop_ntp->joined == 1;
++        MUTEX_UNLOCK(raop_ntp->run_mutex);
++        if (!stopped) return;
++        COND_DESTROY(raop_ntp->stopped_cond);
+         MUTEX_DESTROY(raop_ntp->run_mutex);
+         MUTEX_DESTROY(raop_ntp->wait_mutex);
+         COND_DESTROY(raop_ntp->wait_cond);
+@@ -222,14 +529,22 @@ raop_ntp_init_socket(raop_ntp_t *raop_ntp, int use_ipv6)
+         goto sockets_cleanup;
+     }
+ 
++    raop_ntp->ntp_session = kernel_timestamp_session_create(raop_ntp, tsock);
++    if (raop_ntp->ntp_session == NULL) {
++        logger_log(raop_ntp->logger, LOGGER_ERR, "raop_ntp: Failed to allocate high-precision session context");
++        goto sockets_cleanup;
++    }
++
+     // We're calling recvfrom without knowing whether there is any data, so we need a timeout
+-    uint32_t recv_timeout_msec = 300; 
++    uint32_t recv_timeout_msec = 300;
+ #ifdef _WIN32
+     DWORD tv  = recv_timeout_msec;
++#define CAST (char *)
+ #else
+     struct timeval tv;
+     tv.tv_sec = recv_timeout_msec / (uint32_t) 1000;
+     tv.tv_usec = ((uint32_t) 1000) * (recv_timeout_msec % (uint32_t) 1000);
++#define CAST
+ #endif
+     if (setsockopt(tsock, SOL_SOCKET, SO_RCVTIMEO, CAST &tv, sizeof(tv)) < 0) {
+         goto sockets_cleanup;
+@@ -244,7 +559,13 @@ raop_ntp_init_socket(raop_ntp_t *raop_ntp, int use_ipv6)
+     return 0;
+ 
+     sockets_cleanup:
+-    if (tsock != -1) CLOSESOCKET(tsock);
++    if (raop_ntp->ntp_session != NULL) {
++        kernel_timestamp_session_destroy(raop_ntp->ntp_session);
++        raop_ntp->ntp_session = NULL;
++    } else if (tsock != -1) {
++        // Fallback to protect if the handle crashed out before session instantiation
++        CLOSESOCKET(tsock);
++    }
+     return -1;
+ }
+ 
+@@ -256,33 +577,44 @@ raop_ntp_flush_socket(int fd)
+ #else
+     int bytes_available = 0;
+ #endif
+-    while (IOCTLSOCKET(fd, FIONREAD, &bytes_available) == 0 && bytes_available > 0)
+-    {
++    while (IOCTLSOCKET(fd, FIONREAD, &bytes_available) == 0 && bytes_available > 0) {
+         // We are guaranteed that we won't block, because bytes are available.
+         // Read 1 byte. Extra bytes in the datagram will be discarded.
+         char c;
+         int result = recvfrom(fd, &c, sizeof(c), 0, NULL, NULL);
+-        if (result < 0)
+-        {
++        if (result < 0) {
+             break;
+         }
+     }
+ }
+ 
++#define NTP_BURST_LIMIT RAOP_NTP_DATA_COUNT
+ static THREAD_RETVAL
+-raop_ntp_thread(void *arg)
+-{
++raop_ntp_thread(void *arg) {
+     raop_ntp_t *raop_ntp = arg;
+     assert(raop_ntp);
+     unsigned char response[128] = {0};
+     int response_len = 0;
+     unsigned char request[32] = {0x80, 0xd2, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+-                                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+-    };
+-    raop_ntp_data_t data_sorted[RAOP_NTP_DATA_COUNT];
+-    const unsigned  two_pow_n[RAOP_NTP_DATA_COUNT] = {2, 4, 8, 16, 32, 64, 128, 256};
++                                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
++    double inverse_two_pow_n[RAOP_NTP_DATA_COUNT];
++    for (int i = 0; i < RAOP_NTP_DATA_COUNT; i++) {
++        inverse_two_pow_n[i] = ntp_filter_weight((unsigned int) i);
++    }
+     bool logger_debug = (logger_get_level(raop_ntp->logger) >= LOGGER_DEBUG);
+-    uint64_t recv_time = 0, client_ref_time = 0;
++    uint64_t recv_time = 0;
++
++    bool duplicate_ntp_packet = false;
++    bool bogus_ntp_packet = false;
++
++    raop_ntp->data_index = 0;
++
++    int ntpcount = 0;
++    bool have_offset = false;
++
++    /* these are NTP timestamps in Q32.32 form */
++    q32_32_t t2_raw = 0, t3_raw = 0;
++    q32_32_t t1 = 0, t2 = 0, t3 = 0, t4 = 0;
+ 
+     while (1) {
+         MUTEX_LOCK(raop_ntp->run_mutex);
+@@ -298,98 +630,247 @@ raop_ntp_thread(void *arg)
+         // Send request
+         uint64_t send_time = raop_ntp_get_local_time();
+         byteutils_put_ntp_timestamp(request, 24, send_time);
+-        if (recv_time) {
+-            byteutils_put_long_be(request, 8, client_ref_time);
+-            byteutils_put_ntp_timestamp(request, 16, recv_time);
+-        }
+         int send_len = sendto(raop_ntp->tsock, (char *)request, sizeof(request), 0,
+                               (struct sockaddr *) &raop_ntp->remote_saddr, raop_ntp->remote_saddr_len);
+-        if (logger_debug) {
+-            char *str = utils_data_to_string(request, sizeof(request), 16);
+-            logger_log(raop_ntp->logger, LOGGER_DEBUG, "\nraop_ntp send time type_t=%d packetlen = %d, now = %8.6f\n%s",
+-                       request[1] &~0x80, sizeof(request), (double) send_time / SECOND_IN_NSECS, str);
+-            free(str);
+-        }
+         if (send_len < 0) {
+             int sock_err = SOCKET_GET_ERROR();
+             logger_log(raop_ntp->logger, LOGGER_ERR, "raop_ntp error sending request. Error %d:%s",
+                      sock_err, SOCKET_ERROR_STRING(sock_err));
+         } else {
++            ntpcount++;
++            int pos = raop_ntp->data_index;
++            raop_ntp->data[pos].t1_sent = (q32_32_t) byteutils_get_long_be(request, 24);
++            if (logger_debug) {
++                char *str = utils_data_to_string(request, sizeof(request), 16);
++                logger_log(raop_ntp->logger, LOGGER_DEBUG, "\nraop_ntp request  type_t=%d packetlen = %d, send_time = %8.6f\n%s",
++                           request[1] &~0x80, (int) sizeof(request), (double) send_time / SECOND_IN_NSECS, str);
++                free(str);
++            }
++
+             // Read response
+-            response_len = recvfrom(raop_ntp->tsock, (char *)response, sizeof(response), 0, NULL, NULL);
+-            if (response_len < 0) {
++            uint64_t recv_time_kernel;   // kernel recv timestamp in microsecs * USEC_IN_NSECS
++            uint64_t recv_time_clock;    // userspace recv timestamp in microsecs * USEC_IN_NSECS
++            response_len = kernel_timestamp_session_recv(raop_ntp->ntp_session, (char *) response, sizeof(response),
++                                                         NULL, NULL, &recv_time_kernel, &recv_time_clock);
++            uint64_t localtime = raop_ntp_get_local_time();
++
++            if (response_len < 32) {
+                 char time[30];
+                 ntp_timestamp_to_time(send_time, time, sizeof(time));
+-                logger_log(raop_ntp->logger, LOGGER_DEBUG , "raop_ntp receive timeout (request sent %s)", time);
+-	    } else {
+-                recv_time = raop_ntp_get_local_time();
+-                client_ref_time = byteutils_get_long_be(response, 24);
+-                if (!raop_ntp->client_time_received) {
+-                    raop_ntp->client_time_received = true;
++                if (response_len < 0) {
++                    logger_log(raop_ntp->logger, LOGGER_DEBUG , "raop_ntp received timeout (request sent %s)", time);
++                } else {
++                    logger_log(raop_ntp->logger, LOGGER_ERR , "raop_ntp received truncated response (request sent %s, response_len %d < 32)", time, response_len);
++                }
++            } else {
++                // The iOS client device sends its time in  seconds relative to an arbitrary Epoch (the last boot).
++                // For a little bonus confusion, they add SECONDS_FROM_1900_TO_1970.
++                // To avoid huge offsets, we adjust all remote timestamps (in raw Q32.32 fixed point format) by a fixed offset
++                // raop_ntp->fixed offset, determined when the NTP thread receives its first client time signal.
++
++                // Local time of the server when the NTP request packet left the server  (should equal t1_sent) */
++                t1 = (q32_32_t) byteutils_get_long_be(response, 8);
++
++                // Local timestamp of the client when the NTP request packet arrived at the client
++                t2_raw = (q32_32_t) byteutils_get_long_be(response, 16);
++                /* now adjust t2 to reset client epoch: don't include SECONDS_1900_TO_1970 */
++                t2 = raop_ntp_adjust_remote_timestamp_offset(raop_ntp, t2_raw, false);
++
++                // Local timestamp of the client when the response message left the client  (should not equal t3_prev)
++                t3_raw = (q32_32_t) byteutils_get_long_be(response, 24);
++                byteutils_put_long_be(request, 8, t3_raw);   //return the complete 64-bit client_ref
++                /* now adjust t3 to reset client epoch : don't include SECONDS_1900_TO_1970 */
++                t3 = raop_ntp_adjust_remote_timestamp_offset(raop_ntp, t3_raw, false);
++
++                // local timestamp of the server when the response message arrived at the server
++
++                /* obtain and validate the recv time: use kernel recv timestamp if possible*/
++                bool kernel_time = false;
++                if (!recv_time_kernel && !recv_time_clock) {
++                    recv_time = localtime;
++                } else if (!recv_time_kernel) {
++                    recv_time = recv_time_clock;
++                } else {
++                    /* sanity check on kernel timestamp */
++                    bool sanity = ((int64_t) (recv_time_kernel - send_time) > 0  && (int64_t) (recv_time_clock - recv_time_kernel) > 0);
++                    if (!sanity) {
++                        // signal kernel timestamp inconsistency
++                        MUTEX_LOCK(raop_ntp->sync_params_mutex);
++                        raop_ntp->kernel_timestamp_inconsistency_detected = true;
++                        raop_ntp->last_detection_time = localtime;
++                        MUTEX_UNLOCK(raop_ntp->sync_params_mutex);
++                        recv_time = recv_time_clock;
++                    } else if (!raop_ntp->kernel_timestamp_inconsistency_detected ||
++                               ((int64_t) (localtime - raop_ntp->last_detection_time)) > (12ULL * SECOND_IN_NSECS)) {
++                        recv_time = recv_time_kernel;
++                        kernel_time = true;
++                    } else {
++                        recv_time = recv_time_clock;
++                    }
+                 }
+-                //local time of the server when the NTP response packet returns
+-                int64_t t3 = (int64_t) recv_time;
+-
+-                // Local time of the server when the NTP request packet leaves the server
+-                int64_t t0 = (int64_t) byteutils_get_ntp_timestamp(response, 8);
+-
+-                // Local time of the client when the NTP request packet arrives at the client
+-                int64_t t1 = (int64_t) raop_remote_timestamp_to_nano_seconds(raop_ntp, byteutils_get_long_be(response, 16));
+ 
+-                // Local time of the client when the response message leaves the client
+-                int64_t t2 = (int64_t) raop_remote_timestamp_to_nano_seconds(raop_ntp, byteutils_get_long_be(response, 24));
++                byteutils_put_ntp_timestamp(request, 16, recv_time);
++                t4 = (q32_32_t) byteutils_get_long_be(request, 16);
+ 
+                 if (logger_debug) {
+-                    char *str = utils_data_to_string(response, response_len, 16);                   
++                    char *str = utils_data_to_string(response, response_len, 16);
+                     logger_log(raop_ntp->logger, LOGGER_DEBUG,
+-                               "raop_ntp receive time type_t=%d packetlen = %d, now = %8.6f t1 = %8.6f, t2 = %8.6f\n%s",
+-                               response[1] &~0x80, response_len, (double) t3 / SECOND_IN_NSECS, (double) t1 / SECOND_IN_NSECS,
+-                               (double) t2 / SECOND_IN_NSECS, str); 
++                               "raop_ntp response type_t=%d packetlen = %d, recv_time = %8.6f (%s)\n%s",
++                               response[1] &~0x80, response_len, (double) recv_time / SECOND_IN_NSECS, kernel_time ? "kernel" : "clock", str);
+                     free(str);
+-                }
+-                // The iOS client device sends its time in  seconds relative to an arbitrary Epoch (the last boot).
+-                // For a little bonus confusion, they add SECONDS_FROM_1900_TO_1970.
+-                // This means we have to expect some rather huge offset, but its growth or shrink over time should be small.
+-
+-                raop_ntp->data_index = (raop_ntp->data_index + 1) % RAOP_NTP_DATA_COUNT;
+-                raop_ntp->data[raop_ntp->data_index].time = t3;
+-                raop_ntp->data[raop_ntp->data_index].offset     = ((t1 - t0) + (t2 - t3)) / 2;
+-                raop_ntp->data[raop_ntp->data_index].delay      = ((t3 - t0) - (t2 - t1));
+-                raop_ntp->data[raop_ntp->data_index].dispersion = RAOP_NTP_R_RHO + RAOP_NTP_S_RHO +  (t3 - t0) * RAOP_NTP_PHI_PPM / SECOND_IN_NSECS;
+-
+-                // Sort by delay
+-                memcpy(data_sorted, raop_ntp->data, sizeof(data_sorted));
+-                qsort(data_sorted, RAOP_NTP_DATA_COUNT, sizeof(data_sorted[0]), raop_ntp_compare);
+-
+-                uint64_t dispersion = 0ull;
+-                int64_t offset = data_sorted[0].offset;
+-                int64_t delay = data_sorted[RAOP_NTP_DATA_COUNT - 1].delay;
+-
+-                // Calculate dispersion
+-                for(int i = 0; i < RAOP_NTP_DATA_COUNT; ++i) {
+-                    unsigned long long disp = raop_ntp->data[i].dispersion + (t3 - raop_ntp->data[i].time) * RAOP_NTP_PHI_PPM / SECOND_IN_NSECS;
+-                    dispersion += disp / two_pow_n[i];
++                    logger_log(raop_ntp->logger, LOGGER_DEBUG,
++                               "t1 = %" PRIu64 "\nt2 = %" PRIu64 " (%" PRIu64 ")\nt3 = %" PRIu64 " (%" PRIu64 ")\nt4 = %" PRIu64 "\n" ,
++                               t1, t2, t2_raw, t3, t3_raw, t4);
+                 }
+ 
+-                MUTEX_LOCK(raop_ntp->sync_params_mutex);
++                /* check for a valid t1 (last RAOP_NTP_DATA_COUNT values are available, if corresponding response is not yet received */
++                bogus_ntp_packet = true;
++                int pos0 = pos;
++                for (int i = 0; i < RAOP_NTP_DATA_COUNT; i++) {
++                    if (raop_ntp->data[pos0].t1_sent && raop_ntp->data[pos0].t1_sent == t1) {
++                        raop_ntp->data[pos0].t1_sent = 0;  //per RFC 5905
++                        bogus_ntp_packet = false;
++                        break;
++                    }
++                    pos0++;
++                    pos0 = pos0 % RAOP_NTP_DATA_COUNT;
++                }
++                if (bogus_ntp_packet) {
++                    logger_log(raop_ntp->logger, LOGGER_INFO , "raop_ntp received NTP packet with invalid server ref: %"PRIu64, t1);
++                }
+ 
+-                int64_t correction = offset - raop_ntp->sync_offset;
+-                raop_ntp->sync_offset = offset;
+-                raop_ntp->sync_dispersion = dispersion;
+-                raop_ntp->sync_delay = delay;
+-                MUTEX_UNLOCK(raop_ntp->sync_params_mutex);
++                duplicate_ntp_packet = false;
++                for (int i = 0; i < RAOP_NTP_DATA_COUNT; i++) {
++                    if (raop_ntp->data[i].t3_recv == t3_raw) {
++                        duplicate_ntp_packet = true;
++                        break;
++                    }
++                }
++                if (duplicate_ntp_packet) {
++                    logger_log(raop_ntp->logger, LOGGER_INFO , "raop_ntp received NTP packet with duplicate t3: %"PRIu64, t3_raw);
++                } else {
++                    raop_ntp->data[pos].t3_recv = t3_raw;
++                }
+ 
+-                logger_log(raop_ntp->logger, LOGGER_DEBUG, "raop_ntp sync correction = %lld", correction);
++                if (!bogus_ntp_packet && !duplicate_ntp_packet) {
++                    /* ntp metrics as seconds (as doubles) */
++                    double total_time = ntp_diff_to_seconds(t4,t1);
++                    double client_process_time = ntp_diff_to_seconds(t3,t2);
++                    double client_to_server = ntp_diff_to_seconds(t2,t1);
++                    double server_to_client = ntp_diff_to_seconds(t3,t4);
++                    double raw_delay = total_time - client_process_time;
++                    if (raw_delay < RAOP_NTP_S_RHO) {
++                        raw_delay = RAOP_NTP_S_RHO; //per RFC 5905
++                    }
++
++                    raop_ntp->data[pos].time = t4;
++                    raop_ntp->data[pos].offset = (client_to_server + server_to_client) /2.0;
++                    raop_ntp->data[pos].delay  = raw_delay;
++                    raop_ntp->data[pos].dispersion = RAOP_NTP_R_RHO + RAOP_NTP_S_RHO + (RAOP_NTP_PHI_PPM  * ntp_diff_to_seconds(t4, t1));
++                    raop_ntp->data_index = (pos + 1) % RAOP_NTP_DATA_COUNT;
++
++                    if (logger_debug) {
++                        char table[RAOP_NTP_DATA_COUNT * LINESIZE] = { 0 };
++                        char line[LINESIZE] = {0};
++                        char *ptr = table;
++                        size_t remain = sizeof(table);
++                        for (int i = 0; i < RAOP_NTP_DATA_COUNT; i++) {
++                            snprintf(line, (size_t) LINESIZE, "%d%c %20"PRIu64 " %9.6f %9.6f %12.9f \n", i, (i == pos ? '*' : ' '),
++                                raop_ntp->data[i].time, raop_ntp->data[i].offset, raop_ntp->data[i].delay, raop_ntp->data[i].dispersion);
++                                size_t len = strlen(line);
++                            strncpy(ptr,line,remain);
++                            remain -= len;
++                            ptr += len;
++                        }
++                        logger_log(raop_ntp->logger, LOGGER_DEBUG , "      T4 (NTP Q32:32)      offset     delay   dispersion\n%s", table);
++                    }
++
++                    /* compute new estimate of client-server NTP offset */
++                    int valid_count = 0;
++                    raop_ntp_data_t data_sorted[RAOP_NTP_DATA_COUNT];
++
++                    for(int i = 0; i < RAOP_NTP_DATA_COUNT; ++i) {
++                        if (raop_ntp->data[i].delay == RAOP_NTP_MAX_DISP || raop_ntp->data[i].time == 0) {
++                            continue;
++                        }
++                        double elapsed_seconds = ntp_diff_to_seconds(t4, raop_ntp->data[i].time);
++                        double aged_dispersion = raop_ntp->data[i].dispersion + elapsed_seconds * RAOP_NTP_PHI_PPM;
++                        if (aged_dispersion >= RAOP_NTP_MAX_DISP) {
++                            raop_ntp->data[i].dispersion = RAOP_NTP_MAX_DISP;
++                            continue;
++                        }
++                        raop_ntp->data[i].dispersion = aged_dispersion;
++                        data_sorted[valid_count] = raop_ntp->data[i];
++                        valid_count++;
++                    }
++
++                    if (valid_count > 1) {
++                        qsort(data_sorted, valid_count, sizeof(data_sorted[0]), raop_ntp_compare);
++                    }
++
++                    if (valid_count > 0) {
++                        double total_filter_dispersion = 0.0;
++                        for (int i = 0; i < valid_count; ++i) {
++                            total_filter_dispersion += data_sorted[i].dispersion * inverse_two_pow_n[i];
++                        }
++                        double root_distance = total_filter_dispersion + (data_sorted[0].delay * 0.5);
++
++                        logger_log(raop_ntp->logger, LOGGER_DEBUG, "best NTP data: offset %10.6f, delay %10.6f",
++                                   data_sorted[0].offset, data_sorted[0].delay);
++
++                        int64_t sync_offset = 0;
++                        bool is_synced;
++                        if (root_distance > RAOP_NTP_MAX_DIST) {
++                            is_synced = false;
++                            sync_offset = (int64_t) (data_sorted[0].offset * 1e9);
++                        } else {
++                            double offset;
++                            if (have_offset) {
++                                offset = (double) (raop_ntp->sync_offset * 1e-9);
++                                offset = ((1.0 - RAOP_NTP_ALPHA) * offset) +  (RAOP_NTP_ALPHA * data_sorted[0].offset);
++                            } else {
++                                offset = data_sorted[0].offset;
++                            }
++                            sync_offset = (int64_t) (offset * 1e9);
++                            is_synced = true;
++                        }
++                        uint64_t root_distance_nsec = (uint64_t) (root_distance *1e9);
++                        MUTEX_LOCK(raop_ntp->sync_params_mutex);
++                        bool was_synced = raop_ntp->is_synced;
++                        raop_ntp->client_time_received = true;
++                        raop_ntp->is_synced = is_synced;
++                        raop_ntp->sync_offset = sync_offset;
++                        raop_ntp->root_distance = root_distance_nsec;
++                        raop_ntp->sync_delay = data_sorted[0].delay;
++                        MUTEX_UNLOCK(raop_ntp->sync_params_mutex);
++                        if (was_synced != is_synced) {
++                            logger_log(raop_ntp->logger, LOGGER_INFO,
++                                       "ntp lifecycle sync-state: synced=%d offset_ns=%" PRId64 " distance_ns=%" PRIu64,
++                                       is_synced, sync_offset, root_distance_nsec);
++                        }
++                        have_offset = true;
++                        logger_log(raop_ntp->logger, LOGGER_DEBUG, "current client NTP offset (secs) = %9.6f, root_distance (secs) = %8.6f, is_synced = %s\n",
++                                   (double) sync_offset / SECOND_IN_NSECS, (double) root_distance_nsec / SECOND_IN_NSECS, is_synced ? "TRUE" : "FALSE");
++                    }
++                }
+             }
+         }
+ 
+-        // Sleep for 3 seconds
+         struct timespec wait_time;
+         MUTEX_LOCK(raop_ntp->wait_mutex);
+         clock_gettime(CLOCK_REALTIME, &wait_time);
+-        wait_time.tv_sec += 3;
++        if (ntpcount > (int) NTP_BURST_LIMIT) {
++            wait_time.tv_sec += 3;               // Sleep for 3 seconds
++        } else {
++            wait_time.tv_nsec += 250000000;   // Sleep for 0.25 seconds during initial NTP burst
++            if (wait_time.tv_nsec >= 1000000000LL) {
++                wait_time.tv_sec +=1;
++                wait_time.tv_nsec -= 1000000000LL;
++            }
++        }
+         pthread_cond_timedwait(&raop_ntp->wait_cond, &raop_ntp->wait_mutex, &wait_time);
+         MUTEX_UNLOCK(raop_ntp->wait_mutex);
++        ntpcount = ntpcount > NTP_BURST_LIMIT ? NTP_BURST_LIMIT : ntpcount;
+     }
+ 
+     // Ensure running reflects the actual state
+@@ -410,13 +891,28 @@ raop_ntp_start(raop_ntp_t *raop_ntp, unsigned short *timing_lport)
+     assert(raop_ntp);
+     assert(timing_lport);
+ 
+-    raop_ntp->timing_lport = *timing_lport;
+-
+     MUTEX_LOCK(raop_ntp->run_mutex);
+-    if (raop_ntp->running || !raop_ntp->joined) {
++    while (raop_ntp->joined == 2) {
++        if (raop_ntp->thread && pthread_equal(raop_ntp->thread, pthread_self())) {
++            MUTEX_UNLOCK(raop_ntp->run_mutex);
++            return;
++        }
++        pthread_cond_wait(&raop_ntp->stopped_cond, &raop_ntp->run_mutex);
++    }
++    if (raop_ntp->running) {
++        *timing_lport = raop_ntp->timing_lport;
+         MUTEX_UNLOCK(raop_ntp->run_mutex);
+         return;
+     }
++    int needs_join = !raop_ntp->joined;
++    MUTEX_UNLOCK(raop_ntp->run_mutex);
++    if (needs_join) raop_ntp_stop(raop_ntp);
++    MUTEX_LOCK(raop_ntp->run_mutex);
++    if (raop_ntp->running || raop_ntp->joined != 1) {
++        MUTEX_UNLOCK(raop_ntp->run_mutex);
++        return;
++    }
++    raop_ntp->timing_lport = *timing_lport;
+ 
+     /* Initialize ports and sockets */
+     if (raop_ntp->remote_saddr.ss_family == AF_INET6) {
+@@ -433,9 +929,13 @@ raop_ntp_start(raop_ntp_t *raop_ntp, unsigned short *timing_lport)
+     /* Create the thread and initialize running values */
+     raop_ntp->running = 1;
+     raop_ntp->joined = 0;
+-    
++
+     THREAD_CREATE(raop_ntp->thread, raop_ntp_thread, raop_ntp);
++    int thread_created = raop_ntp->thread != 0;
++    logger_log(raop_ntp->logger, LOGGER_INFO, "ntp lifecycle start: timing=%u thread=%s",
++               raop_ntp->timing_lport, thread_created ? "created" : "failed");
+     MUTEX_UNLOCK(raop_ntp->run_mutex);
++    if (!thread_created) raop_ntp_stop(raop_ntp);
+ }
+ 
+ void
+@@ -446,11 +946,18 @@ raop_ntp_stop(raop_ntp_t *raop_ntp)
+     /* Check that we are running and thread is not
+      * joined (should never be while still running) */
+     MUTEX_LOCK(raop_ntp->run_mutex);
+-    if (!raop_ntp->running || raop_ntp->joined) {
++    if (raop_ntp->thread && pthread_equal(raop_ntp->thread, pthread_self())) {
++        raop_ntp->running = 0;
++        MUTEX_UNLOCK(raop_ntp->run_mutex);
++        return;
++    }
++    while (raop_ntp->joined == 2) pthread_cond_wait(&raop_ntp->stopped_cond, &raop_ntp->run_mutex);
++    if (raop_ntp->joined) {
+         MUTEX_UNLOCK(raop_ntp->run_mutex);
+         return;
+     }
+     raop_ntp->running = 0;
++    raop_ntp->joined = 2; /* another stop/start must not reuse this session until the join finishes */
+     MUTEX_UNLOCK(raop_ntp->run_mutex);
+ 
+     logger_log(raop_ntp->logger, LOGGER_DEBUG, "raop_ntp stopping time thread");
+@@ -459,9 +966,14 @@ raop_ntp_stop(raop_ntp_t *raop_ntp)
+     COND_SIGNAL(raop_ntp->wait_cond);
+     MUTEX_UNLOCK(raop_ntp->wait_mutex);
+ 
+-    THREAD_JOIN(raop_ntp->thread);
++    if (raop_ntp->thread) THREAD_JOIN(raop_ntp->thread);
++    raop_ntp->thread = 0;
+ 
+-    if (raop_ntp->tsock != -1) {
++    if (raop_ntp->ntp_session != NULL) {
++        kernel_timestamp_session_destroy(raop_ntp->ntp_session);
++        raop_ntp->ntp_session = NULL;
++        raop_ntp->tsock = -1;
++    } else if (raop_ntp->tsock != -1) {
+         CLOSESOCKET(raop_ntp->tsock);
+         raop_ntp->tsock = -1;
+     }
+@@ -470,10 +982,25 @@ raop_ntp_stop(raop_ntp_t *raop_ntp)
+ 
+     /* Mark thread as joined */
+     MUTEX_LOCK(raop_ntp->run_mutex);
++    logger_log(raop_ntp->logger, LOGGER_INFO, "ntp lifecycle stopped: timing socket released");
+     raop_ntp->joined = 1;
++    pthread_cond_broadcast(&raop_ntp->stopped_cond);
+     MUTEX_UNLOCK(raop_ntp->run_mutex);
+ }
+ 
++void raop_ntp_get_sync_params(raop_ntp_t *raop_ntp, int64_t *offset_ns, double *delay_sec) {
++    if (!raop_ntp) return;
++
++    MUTEX_LOCK(raop_ntp->sync_params_mutex);
++    if (offset_ns) {
++        *offset_ns = raop_ntp->sync_offset;
++    }
++    if (delay_sec) {
++        *delay_sec = raop_ntp->sync_delay;
++    }
++    MUTEX_UNLOCK(raop_ntp->sync_params_mutex);
++}
++
+ /**
+  * Converts from a little endian ntp timestamp to nano seconds since the Unix epoch.
+  * Does the same thing as byteutils_get_ntp_timestamp, except its input is an uint64_t
+@@ -481,14 +1008,9 @@ raop_ntp_stop(raop_ntp_t *raop_ntp)
+  * Please note this just converts to a different representation, the clock remains the
+  * same.
+  */
+-uint64_t raop_ntp_timestamp_to_nano_seconds(uint64_t ntp_timestamp, bool account_for_epoch_diff) {
+-    uint64_t seconds = ((ntp_timestamp >> 32) & 0xffffffff) - (account_for_epoch_diff ? SECONDS_FROM_1900_TO_1970 : 0);
+-    uint64_t fraction = (ntp_timestamp & 0xffffffff);
+-    return (seconds * SECOND_IN_NSECS) + ((fraction * SECOND_IN_NSECS) >> 32);
+-}
+ 
+-uint64_t raop_remote_timestamp_to_nano_seconds(raop_ntp_t *raop_ntp, uint64_t timestamp) {
+-    uint64_t seconds = ((timestamp >> 32) & 0xffffffff);
++uint64_t raop_ntp_timestamp_to_nano_seconds(raop_ntp_t *raop_ntp, uint64_t timestamp) {
++    uint64_t seconds = (timestamp >> 32);
+     if (raop_ntp->time_protocol == NTP) seconds -= SECONDS_FROM_1900_TO_1970;
+     uint64_t fraction = (timestamp & 0xffffffff);
+     return (seconds * SECOND_IN_NSECS) + ((fraction * SECOND_IN_NSECS) >> 32);
+@@ -507,37 +1029,57 @@ uint64_t raop_ntp_get_local_time() {
+  * Returns the current time in nano seconds according to the remote wall clock.
+  */
+ uint64_t raop_ntp_get_remote_time(raop_ntp_t *raop_ntp) {
+-    if  (!raop_ntp->client_time_received) {
+-        return 0;
+-    }
+     MUTEX_LOCK(raop_ntp->sync_params_mutex);
++    bool have_time = raop_ntp->client_time_received;
+     int64_t offset = raop_ntp->sync_offset;
+     MUTEX_UNLOCK(raop_ntp->sync_params_mutex);
+-    return (uint64_t) ((int64_t) raop_ntp_get_local_time() + offset);
++    if (!have_time) return 0;
++    return (uint64_t) (((int64_t) raop_ntp_get_local_time()) + offset);
+ }
+ 
+ /**
+  * Returns the local wall clock time in nano seconds for the given point in remote clock time
+  */
+ uint64_t raop_ntp_convert_remote_time(raop_ntp_t *raop_ntp, uint64_t remote_time) {
+-    if  (!raop_ntp->client_time_received) {
+-        return 0;
+-    }
+     MUTEX_LOCK(raop_ntp->sync_params_mutex);
++    bool have_time = raop_ntp->client_time_received;
+     int64_t offset = raop_ntp->sync_offset;
+     MUTEX_UNLOCK(raop_ntp->sync_params_mutex);
+-    return (uint64_t) ((int64_t) remote_time - offset);
++    if (!have_time) return 0;
++    return (uint64_t) (((int64_t) remote_time) - offset);
+ }
+ 
+ /**
+  * Returns the remote wall clock time in nano seconds for the given point in local clock time
+  */
+ uint64_t raop_ntp_convert_local_time(raop_ntp_t *raop_ntp, uint64_t local_time) {
+-    if  (!raop_ntp->client_time_received) {
+-        return 0;
+-    }
+     MUTEX_LOCK(raop_ntp->sync_params_mutex);
++    bool have_time = raop_ntp->client_time_received;
+     int64_t offset = raop_ntp->sync_offset;
+     MUTEX_UNLOCK(raop_ntp->sync_params_mutex);
+-    return (uint64_t) ((int64_t) local_time + offset);
++    if (!have_time) return 0;
++    return (uint64_t) (((int64_t) local_time) + offset);
++}
++
++// adjust a client raw timestamp by the fixed Q32.32 offset
++q32_32_t raop_ntp_adjust_remote_timestamp_offset(raop_ntp_t *raop_ntp, q32_32_t ntp_timestamp_raw, bool add_secs_1900_to_1970) {
++    q32_32_t timestamp = ntp_timestamp_raw;
++    if (add_secs_1900_to_1970) {
++        timestamp += 2208988800ULL << 32;
++    }
++    MUTEX_LOCK(raop_ntp->sync_params_mutex);
++    if (!raop_ntp->have_fixed_offset) {
++        unsigned char request[8] = {0};
++        uint64_t local_time = raop_ntp_get_local_time();
++        byteutils_put_ntp_timestamp(request, 0, local_time);
++        q32_32_t local_ref_time = byteutils_get_long_be(request,0);
++        q32_32_t fixed_offset = local_ref_time - timestamp;
++        raop_ntp->fixed_offset = fixed_offset;
++        raop_ntp->have_fixed_offset = true;
++        logger_log(raop_ntp->logger, LOGGER_INFO, "ntp lifecycle clock-reference-established: protocol=%d", raop_ntp->time_protocol);
++    }
++    assert(raop_ntp->have_fixed_offset);
++    q32_32_t adjusted = (q32_32_t) (timestamp + raop_ntp->fixed_offset);
++    MUTEX_UNLOCK(raop_ntp->sync_params_mutex);
++    return adjusted;
+ }
+diff --git a/lib/raop_ntp.h b/lib/raop_ntp.h
+index ad7a1ad..1e95636 100644
+--- a/lib/raop_ntp.h
++++ b/lib/raop_ntp.h
+@@ -21,10 +21,35 @@
+ 
+ #include <stdbool.h>
+ #include <stdint.h>
++#include <sys/types.h>
+ #include "logger.h"
+ 
++typedef uint64_t q32_32_t;
++
+ typedef struct raop_ntp_s raop_ntp_t;
+ 
++typedef struct kernel_timestamp_session_s {
++    int sock_fd;
++    raop_ntp_t *raop_ntp;
++    uint64_t suspend_kernel_timestamps_until;
++    int timestamp_mode_reported;
++#ifdef _WIN32
++    void *pWSARecvMsg_ptr;
++    int64_t base_qpc_ticks;
++    int64_t qpc_frequency;
++    uint64_t base_system_time_us;
++#endif
++
++} kernel_timestamp_session_t;
++
++void raop_ntp_global_init(void);
++kernel_timestamp_session_t * kernel_timestamp_session_create(raop_ntp_t *raop_ntp, int sock_fd);
++ssize_t kernel_timestamp_session_recv(kernel_timestamp_session_t *session, char *buf, size_t buf_len,
++                                      void *src_addr, int *addrlen, uint64_t *recv_time_kernel_ns, uint64_t *recv_time_clock_ns);
++
++void kernel_timestamp_session_destroy(kernel_timestamp_session_t *session);
++void *raop_ntp_thread_worker(void *param);
++
+ typedef enum timing_protocol_e { NTP, TP_NONE, TP_OTHER, TP_UNSPECIFIED } timing_protocol_t;
+ 
+ void raop_ntp_start(raop_ntp_t *raop_ntp, unsigned short *timing_lport);
+@@ -35,15 +60,19 @@ unsigned short raop_ntp_get_port(raop_ntp_t *raop_ntp);
+ 
+ void raop_ntp_destroy(raop_ntp_t *raop_rtp);
+ 
+-uint64_t raop_ntp_timestamp_to_nano_seconds(uint64_t ntp_timestamp, bool account_for_epoch_diff);
+-uint64_t raop_remote_timestamp_to_nano_seconds(raop_ntp_t *raop_ntp, uint64_t timestamp);
++uint64_t raop_ntp_timestamp_to_nano_seconds(raop_ntp_t* raop_ntp, uint64_t timestamp);
++q32_32_t raop_ntp_adjust_remote_timestamp_offset(raop_ntp_t *raop_ntp, q32_32_t ntp_timestamp_raw,
++						 bool add_seconds_1900_to_1970);
+ 
+ uint64_t raop_ntp_get_local_time();
+ uint64_t raop_ntp_get_remote_time(raop_ntp_t *raop_ntp);
+ uint64_t raop_ntp_convert_remote_time(raop_ntp_t *raop_ntp, uint64_t remote_time);
+ uint64_t raop_ntp_convert_local_time(raop_ntp_t *raop_ntp, uint64_t local_time);
+-
++void raop_ntp_get_sync_params(raop_ntp_t *raop_ntp, int64_t *offset_ns, double *delay_sec);
+ void  raop_ntp_set_video_arrival_offset(raop_ntp_t* raop_ntp, const uint64_t *offset);
+ uint64_t raop_ntp_get_video_arrival_offset(raop_ntp_t* raop_ntp);
++#ifdef UXPLAY_NTP_LIFECYCLE_TESTS
++double raop_ntp_test_filter_weight(unsigned int index);
++#endif
+ 
+ #endif //RAOP_NTP_H
+diff --git a/lib/raop_rtp.c b/lib/raop_rtp.c
+index 64eb7fb..85409db 100644
+--- a/lib/raop_rtp.c
++++ b/lib/raop_rtp.c
+@@ -90,6 +90,10 @@ struct raop_rtp_s {
+     int flush;
+     thread_handle_t thread;
+     mutex_handle_t run_mutex;
++    cond_handle_t stopped_cond;
++#ifdef UXPLAY_RTP_LIFECYCLE_TESTS
++    int test_exit_requested;
++#endif
+     /* MUTEX LOCKED VARIABLES END */
+ 
+     /* Remote control and timing ports */
+@@ -97,6 +101,7 @@ struct raop_rtp_s {
+ 
+     /* Sockets for control and data */
+     int csock, dsock;
++    kernel_timestamp_session_t *rtp_session_dsock;
+ 
+     /* Local control, timing and data ports */
+     unsigned short control_lport;
+@@ -109,6 +114,7 @@ struct raop_rtp_s {
+ 
+     /* audio compression type: ct = 2 (ALAC), ct = 8 (AAC_ELD) (ct = 4 would be AAC-MAIN) */
+     unsigned char ct;
++    unsigned int sample_rate;
+ };
+ 
+ static int
+@@ -176,8 +182,12 @@ raop_rtp_init(logger_t *logger, raop_callbacks_t *callbacks, raop_ntp_t *ntp, co
+     raop_rtp->running = 0;
+     raop_rtp->joined = 1;
+     raop_rtp->flush = NO_FLUSH;
++    raop_rtp->csock = -1;
++    raop_rtp->dsock = -1;
++    raop_rtp->rtp_session_dsock = NULL;
+ 
+     MUTEX_CREATE(raop_rtp->run_mutex);
++    COND_CREATE(raop_rtp->stopped_cond);
+     return raop_rtp;
+ }
+ 
+@@ -186,6 +196,11 @@ raop_rtp_destroy(raop_rtp_t *raop_rtp)
+ {
+     if (raop_rtp) {
+         raop_rtp_stop(raop_rtp);
++        MUTEX_LOCK(raop_rtp->run_mutex);
++        int stopped = raop_rtp->joined == 1;
++        MUTEX_UNLOCK(raop_rtp->run_mutex);
++        if (!stopped) return; /* a worker must never destroy itself while still unwinding */
++        COND_DESTROY(raop_rtp->stopped_cond);
+         MUTEX_DESTROY(raop_rtp->run_mutex);
+         raop_buffer_destroy(raop_rtp->buffer);
+         free(raop_rtp->metadata);
+@@ -244,6 +259,12 @@ raop_rtp_init_sockets(raop_rtp_t *raop_rtp, int use_ipv6)
+         goto sockets_cleanup;
+     }
+ 
++    raop_rtp->rtp_session_dsock = kernel_timestamp_session_create(raop_rtp->ntp, dsock);
++    if (!raop_rtp->rtp_session_dsock) {
++        logger_log(raop_rtp->logger, LOGGER_ERR, "raop_rtp: could not allocate timestamp session");
++        goto sockets_cleanup;
++    }
++
+     /* Set socket descriptors */
+     raop_rtp->csock = csock;
+     raop_rtp->dsock = dsock;
+@@ -257,7 +278,12 @@ raop_rtp_init_sockets(raop_rtp_t *raop_rtp, int use_ipv6)
+ 
+     sockets_cleanup:
+     if (csock != -1) CLOSESOCKET(csock);
+-    if (dsock != -1) CLOSESOCKET(dsock);
++    if (raop_rtp->rtp_session_dsock) {
++        kernel_timestamp_session_destroy(raop_rtp->rtp_session_dsock);
++        raop_rtp->rtp_session_dsock = NULL;
++    } else if (dsock != -1) {
++        CLOSESOCKET(dsock);
++    }
+     return -1;
+ }
+ 
+@@ -267,6 +293,12 @@ raop_rtp_process_events(raop_rtp_t *raop_rtp, void *cb_data)
+     assert(raop_rtp);
+ 
+     MUTEX_LOCK(raop_rtp->run_mutex);
++#ifdef UXPLAY_RTP_LIFECYCLE_TESTS
++    if (raop_rtp->test_exit_requested) {
++        MUTEX_UNLOCK(raop_rtp->run_mutex);
++        return 1;
++    }
++#endif
+     if (!raop_rtp->running) {
+         MUTEX_UNLOCK(raop_rtp->run_mutex);
+         return 1;
+@@ -381,11 +413,13 @@ raop_rtp_thread_udp(void *arg)
+ {
+     raop_rtp_t *raop_rtp = arg;
+     unsigned char packet[RAOP_PACKET_LEN];
+-    unsigned int packetlen = 0;
+-    struct sockaddr_storage saddr;
++    int packetlen = 0;
++    struct sockaddr_storage saddr = {0};
+     socklen_t saddrlen = 0;
+     bool got_remote_control_saddr = false;
+     uint64_t video_arrival_offset = 0;
++    uint64_t recv_time_kernel = 0;
++    uint64_t recv_time_clock = 0;
+ 
+     /* initial audio stream has no data */    
+     unsigned char no_data_marker[] = {0x00, 0x68, 0x34, 0x00 };
+@@ -459,6 +493,13 @@ raop_rtp_thread_udp(void *arg)
+             } else {
+                 packetlen = recvfrom(raop_rtp->csock, (char *)packet, sizeof(packet), 0, NULL, NULL);
+             }
++            if (packetlen < 2) {
++                if (packetlen < 0) {
++                    int sock_err = SOCKET_GET_ERROR();
++                    logger_log(raop_rtp->logger, LOGGER_WARNING, "audio control receive failed: %d", sock_err);
++                }
++                continue;
++            }
+             int type_c = packet[1] & ~0x80;
+             logger_log(raop_rtp->logger, LOGGER_DEBUG, "\nraop_rtp type_c 0x%02x, packetlen = %d", type_c, packetlen);
+ 
+@@ -491,16 +532,18 @@ raop_rtp_thread_udp(void *arg)
+                 // The unit for the rtp clock is 1 / sample rate = 1 / 44100
+                 uint64_t client_ntp_sync_prev = 0;
+                 uint64_t rtp_sync_prev = 0;
++                MUTEX_LOCK(raop_rtp->run_mutex);
+                 if (!raop_rtp->initial_sync) {
+-                    logger_log(raop_rtp->logger, LOGGER_DEBUG, "first audio rtp sync");
++                    logger_log(raop_rtp->logger, LOGGER_INFO, "audio RTP lifecycle first-sync: ct=%u", raop_rtp->ct);
+                     raop_rtp->initial_sync = true;
+                 } else {
+                    client_ntp_sync_prev = raop_rtp->client_ntp_sync;
+                    rtp_sync_prev = raop_rtp->rtp_sync;
+                 }
+                 raop_rtp->rtp_sync = byteutils_get_int_be(packet, 4);
+-                uint64_t sync_ntp_raw = byteutils_get_long_be(packet, 8);
+-                raop_rtp->client_ntp_sync = raop_remote_timestamp_to_nano_seconds(raop_rtp->ntp, sync_ntp_raw);
++                uint64_t sync_ntp_raw = raop_ntp_adjust_remote_timestamp_offset(raop_rtp->ntp, byteutils_get_long_be(packet, 8), false);
++                raop_rtp->client_ntp_sync = raop_ntp_timestamp_to_nano_seconds(raop_rtp->ntp, sync_ntp_raw);
++                MUTEX_UNLOCK(raop_rtp->run_mutex);
+  
+                 if (logger_debug) {
+                     double offset_change = ((double) raop_rtp->client_ntp_sync) - raop_rtp->rtp_clock_rate * raop_rtp->rtp_sync;
+@@ -563,7 +606,8 @@ raop_rtp_thread_udp(void *arg)
+             //logger_log(raop_rtp->logger, LOGGER_INFO, "Would have data packet in queue");
+             // Receiving audio data here
+             saddrlen = sizeof(saddr);
+-            packetlen = recvfrom(raop_rtp->dsock, (char *)packet, sizeof(packet), 0, NULL, NULL);
++            packetlen = (int) kernel_timestamp_session_recv(raop_rtp->rtp_session_dsock, (char *) packet, sizeof(packet),
++                                                            NULL, NULL, &recv_time_kernel, &recv_time_clock);
+             // rtp payload type
+             //int type_d = packet[1] & ~0x80;
+             //logger_log(raop_rtp->logger, LOGGER_DEBUG, "raop_rtp_thread_udp type_d 0x%02x, packetlen = %d", type_d, packetlen);
+@@ -578,6 +622,7 @@ raop_rtp_thread_udp(void *arg)
+                 continue;
+             }
+ 
++            MUTEX_LOCK(raop_rtp->run_mutex);
+             if (!raop_rtp->initial_sync &&  raop_rtp->ct == 8 && video_arrival_offset) {
+                 /* estimate a fake initial remote timestamp for video  synchronization  with AAC audio before the first rtp sync */
+                  uint64_t ts = raop_ntp_get_local_time() - video_arrival_offset;
+@@ -586,12 +631,15 @@ raop_rtp_thread_udp(void *arg)
+                  raop_rtp->client_ntp_sync = ts;
+                  raop_rtp->rtp_sync = byteutils_get_int_be(packet, 4);
+                  raop_rtp->initial_sync = true;
+-            }	    
+-
+-            if (packetlen == 12 ||(packetlen == 16 && memcmp(packet + 12, no_data_marker, 4) == 0)) {
+-                /* this is a "no data" packet */
+-	        /* the first such packet could be used to provide the initial rtptime and seqnum formerly given in the RECORD request */
+-                continue;
++            }
++            MUTEX_UNLOCK(raop_rtp->run_mutex);
++
++            /* the first no-data packet (len 12 or len 16 (12 + 4 byte marker) could be used to provide the initial rtptime and seqnum
++             * formerly given in the RECORD request */
++            if (packetlen == 12) {
++                /* this is an empty packet, without the 4-byte "no-data" marker (add the Marker, it appears to be an older protocal AirMyPC variant */
++                memcpy(packet + 12, no_data_marker, 4);
++                packetlen = 16;
+             }
+ 	    
+             if (raop_rtp->ct == 2 && packetlen == 44)  continue;   /* ignore the ALAC packets with format information only. */
+@@ -610,6 +658,10 @@ raop_rtp_thread_udp(void *arg)
+                 uint32_t rtp_timestamp = 0;
+ 
+                 while ((payload = raop_buffer_dequeue(raop_rtp->buffer, &payload_size, &rtp_timestamp, &seqnum, no_resend))) {
++                    if (payload_size == 4 && memcmp(payload, no_data_marker, 4) == 0) {
++                        free(payload);
++                        continue;
++                    }
+                     audio_decode_struct audio_data; 
+                     audio_data.rtp_time = rtp_timestamp;
+                     audio_data.seqnum = seqnum;
+@@ -645,7 +697,7 @@ raop_rtp_thread_udp(void *arg)
+     raop_rtp->running = false;
+     MUTEX_UNLOCK(raop_rtp->run_mutex);
+ 
+-    logger_log(raop_rtp->logger, LOGGER_DEBUG, "raop_rtp exiting thread");
++    logger_log(raop_rtp->logger, LOGGER_INFO, "audio RTP lifecycle thread-exited: ct=%u", raop_rtp->ct);
+ 
+     return 0;
+ }
+@@ -655,19 +707,54 @@ void
+ raop_rtp_start_audio(raop_rtp_t *raop_rtp,  unsigned short *control_rport, unsigned short *control_lport,
+                      unsigned short *data_lport, unsigned char *ct, unsigned int *sr)
+ {
+-    logger_log(raop_rtp->logger, LOGGER_INFO, "raop_rtp starting audio");
+     int use_ipv6 = 0;
+ 
+     assert(raop_rtp);
++    if (!ct || !sr || !*sr) return;
++
++    MUTEX_LOCK(raop_rtp->run_mutex);
++    while (raop_rtp->joined == 2) {
++        if (raop_rtp->thread && pthread_equal(raop_rtp->thread, pthread_self())) {
++            MUTEX_UNLOCK(raop_rtp->run_mutex);
++            return;
++        }
++        pthread_cond_wait(&raop_rtp->stopped_cond, &raop_rtp->run_mutex);
++    }
++    if (raop_rtp->running && raop_rtp->ct == *ct && raop_rtp->sample_rate == *sr && raop_rtp->control_rport == *control_rport) {
++        *control_lport = raop_rtp->control_lport;
++        *data_lport = raop_rtp->data_lport;
++        logger_log(raop_rtp->logger, LOGGER_INFO, "audio RTP lifecycle active-session-reused: ct=%u control=%u data=%u",
++                   raop_rtp->ct, raop_rtp->control_lport, raop_rtp->data_lport);
++        MUTEX_UNLOCK(raop_rtp->run_mutex);
++        return;
++    }
++    int needs_join = !raop_rtp->joined;
++    MUTEX_UNLOCK(raop_rtp->run_mutex);
++    /* A worker can have exited by itself while still owning its two sockets. */
++    if (needs_join) raop_rtp_stop(raop_rtp);
+ 
+     MUTEX_LOCK(raop_rtp->run_mutex);
+-    if (raop_rtp->running || !raop_rtp->joined) {
++    if (raop_rtp->running || raop_rtp->joined != 1) {
+         MUTEX_UNLOCK(raop_rtp->run_mutex);
+         return;
+     }
+ 
++    raop_rtp->initial_sync = false;
++    raop_rtp->rtp_sync = 0;
++    raop_rtp->client_ntp_sync = 0;
++    raop_rtp->ntp_start_time = 0;
++    raop_rtp->control_seqnum = 0;
++    raop_rtp->control_saddr_len = 0;
++#ifdef UXPLAY_RTP_LIFECYCLE_TESTS
++    raop_rtp->test_exit_requested = 0;
++#endif
++    memset(&raop_rtp->control_saddr, 0, sizeof(raop_rtp->control_saddr));
++    raop_rtp->flush = NO_FLUSH;
++    raop_buffer_flush(raop_rtp->buffer, -1);
++
+     raop_rtp->ct = *ct;
+-    raop_rtp->rtp_clock_rate = SECOND_IN_NSECS / *sr;
++    raop_rtp->sample_rate = *sr;
++    raop_rtp->rtp_clock_rate = (double) SECOND_IN_NSECS / (double) *sr;
+ 
+     /* Initialize ports and sockets */
+     raop_rtp->control_lport = *control_lport;
+@@ -689,7 +776,12 @@ raop_rtp_start_audio(raop_rtp_t *raop_rtp,  unsigned short *control_rport, unsig
+     raop_rtp->joined = 0;
+ 
+     THREAD_CREATE(raop_rtp->thread, raop_rtp_thread_udp, raop_rtp);
++    int thread_created = raop_rtp->thread != 0;
++    logger_log(raop_rtp->logger, LOGGER_INFO,
++               "audio RTP lifecycle start: ct=%u rate=%u control=%u data=%u sync-mapping=reset thread=%s",
++               *ct, *sr, raop_rtp->control_lport, raop_rtp->data_lport, thread_created ? "created" : "failed");
+     MUTEX_UNLOCK(raop_rtp->run_mutex);
++    if (!thread_created) raop_rtp_stop(raop_rtp);
+ }
+ 
+ void
+@@ -806,21 +898,34 @@ raop_rtp_stop(raop_rtp_t *raop_rtp)
+     /* Check that we are running and thread is not
+      * joined (should never be while still running) */
+     MUTEX_LOCK(raop_rtp->run_mutex);
+-    if (!raop_rtp->running || raop_rtp->joined) {
++    if (raop_rtp->thread && pthread_equal(raop_rtp->thread, pthread_self())) {
++        raop_rtp->running = 0;
++        MUTEX_UNLOCK(raop_rtp->run_mutex);
++        return; /* the owner joins this worker after its callback returns */
++    }
++    while (raop_rtp->joined == 2) pthread_cond_wait(&raop_rtp->stopped_cond, &raop_rtp->run_mutex);
++    if (raop_rtp->joined) {
+         MUTEX_UNLOCK(raop_rtp->run_mutex);
+         return;
+     }
+     raop_rtp->running = 0;
++    raop_rtp->joined = 2;
+     MUTEX_UNLOCK(raop_rtp->run_mutex);
+ 
+     /* Join the thread */
+-    THREAD_JOIN(raop_rtp->thread);
++    if (raop_rtp->thread) THREAD_JOIN(raop_rtp->thread);
++    raop_rtp->thread = 0;
+ 
+     if (raop_rtp->csock != -1) {
+         CLOSESOCKET(raop_rtp->csock);
+         raop_rtp->csock = -1;
+     }
+-    if (raop_rtp->dsock != -1) {
++    /* Upstream b29411f: the timestamp session owns and closes its data socket. */
++    if (raop_rtp->rtp_session_dsock) {
++        kernel_timestamp_session_destroy(raop_rtp->rtp_session_dsock);
++        raop_rtp->rtp_session_dsock = NULL;
++        raop_rtp->dsock = -1;
++    } else if (raop_rtp->dsock != -1) {
+         CLOSESOCKET(raop_rtp->dsock);
+         raop_rtp->dsock = -1;
+     }
+@@ -831,6 +936,12 @@ raop_rtp_stop(raop_rtp_t *raop_rtp)
+     /* Mark thread as joined */
+     MUTEX_LOCK(raop_rtp->run_mutex);
+     raop_rtp->joined = 1;
++    raop_rtp->initial_sync = false;
++    raop_rtp->rtp_sync = 0;
++    raop_rtp->client_ntp_sync = 0;
++    raop_rtp->flush = NO_FLUSH;
++    logger_log(raop_rtp->logger, LOGGER_INFO, "audio RTP lifecycle stopped: control/data sockets released, sync-mapping reset");
++    pthread_cond_broadcast(&raop_rtp->stopped_cond);
+     MUTEX_UNLOCK(raop_rtp->run_mutex);
+ }
+ 
+@@ -843,3 +954,26 @@ raop_rtp_is_running(raop_rtp_t *raop_rtp)
+     MUTEX_UNLOCK(raop_rtp->run_mutex);
+     return running;
+ }
++
++#ifdef UXPLAY_RTP_LIFECYCLE_TESTS
++void raop_rtp_test_get_state(raop_rtp_t *raop_rtp, struct raop_rtp_test_state *state) {
++    if (!raop_rtp || !state) return;
++    MUTEX_LOCK(raop_rtp->run_mutex);
++    state->running = raop_rtp->running;
++    state->joined = raop_rtp->joined;
++    state->csock = raop_rtp->csock;
++    state->dsock = raop_rtp->dsock;
++    state->has_timestamp_session = raop_rtp->rtp_session_dsock != NULL;
++    state->initial_sync = raop_rtp->initial_sync;
++    state->rtp_sync = raop_rtp->rtp_sync;
++    state->client_ntp_sync = raop_rtp->client_ntp_sync;
++    state->flush = raop_rtp->flush;
++    MUTEX_UNLOCK(raop_rtp->run_mutex);
++}
++
++void raop_rtp_test_request_exit(raop_rtp_t *raop_rtp) {
++    MUTEX_LOCK(raop_rtp->run_mutex);
++    raop_rtp->test_exit_requested = 1; /* the normal worker loop performs the exit */
++    MUTEX_UNLOCK(raop_rtp->run_mutex);
++}
++#endif
+diff --git a/lib/raop_rtp.h b/lib/raop_rtp.h
+index d9f5476..9ee13e3 100644
+--- a/lib/raop_rtp.h
++++ b/lib/raop_rtp.h
+@@ -44,5 +44,15 @@ void raop_rtp_flush(raop_rtp_t *raop_rtp, int next_seq);
+ void raop_rtp_stop(raop_rtp_t *raop_rtp);
+ int raop_rtp_is_running(raop_rtp_t *raop_rtp);
+ void raop_rtp_destroy(raop_rtp_t *raop_rtp);
++#ifdef UXPLAY_RTP_LIFECYCLE_TESTS
++struct raop_rtp_test_state {
++    int running, joined, csock, dsock, has_timestamp_session, initial_sync;
++    uint32_t rtp_sync;
++    uint64_t client_ntp_sync;
++    int flush;
++};
++void raop_rtp_test_get_state(raop_rtp_t *raop_rtp, struct raop_rtp_test_state *state);
++void raop_rtp_test_request_exit(raop_rtp_t *raop_rtp);
++#endif
+ 
+ #endif
+diff --git a/lib/raop_rtp_mirror.c b/lib/raop_rtp_mirror.c
+index 2efee1b..963ba83 100644
+--- a/lib/raop_rtp_mirror.c
++++ b/lib/raop_rtp_mirror.c
+@@ -332,8 +332,9 @@ raop_rtp_mirror_thread(void *arg)
+                 n -= 3;
+                 p += 3;
+             }
+-            ntp_timestamp_raw = byteutils_get_long(packet, 8);
+-            ntp_timestamp_remote = raop_ntp_timestamp_to_nano_seconds(ntp_timestamp_raw, false);
++            /* Video timestamps omit the NTP epoch, unlike audio/control timestamps. */
++            ntp_timestamp_raw = raop_ntp_adjust_remote_timestamp_offset(raop_rtp_mirror->ntp, byteutils_get_long(packet, 8), true);
++            ntp_timestamp_remote = raop_ntp_timestamp_to_nano_seconds(raop_rtp_mirror->ntp, ntp_timestamp_raw);
+             if (first_packet) {
+ 	        uint64_t offset  = raop_ntp_get_local_time() - ntp_timestamp_remote;
+                 raop_ntp_set_video_arrival_offset(raop_rtp_mirror->ntp, &offset);
+diff --git a/renderers/audio_renderer.c b/renderers/audio_renderer.c
+index ddcd14e..52fe0fe 100644
+--- a/renderers/audio_renderer.c
++++ b/renderers/audio_renderer.c
+@@ -26,7 +26,11 @@
+ #include "audio_renderer.h"
+ #define SECOND_IN_NSECS 1000000000UL
+ 
+-#define NFORMATS 2     /* set to 4 to enable AAC_LD and PCM:  allowed, but  never seen in real-world use */
++#ifdef UXPLAY_AUDIO_LIFECYCLE_TESTS
++#define NFORMATS 4     /* Offline tests use the production PCM path with a silent fakesink. */
++#else
++#define NFORMATS 2
++#endif
+ 
+ static GstClockTime gst_audio_pipeline_base_time = GST_CLOCK_TIME_NONE;
+ static logger_t *logger = NULL;
+@@ -41,6 +45,9 @@ static gboolean async = FALSE;
+ static gboolean vsync = FALSE;
+ static gboolean sync = FALSE;
+ static gboolean audio_rtp = FALSE;
++static GRecMutex audio_lock;
++static unsigned int stale_timestamp_count = 0;
++static gint64 last_stale_timestamp_log = 0;
+ 
+ typedef struct audio_renderer_s {
+     GstElement *appsrc; 
+@@ -48,6 +55,12 @@ typedef struct audio_renderer_s {
+     GstElement *volume;
+     GstBus *bus;
+     unsigned char ct;
++    gboolean needs_reset;
++    unsigned int recovery_attempts;
++    gint64 healthy_since;
++    gint64 last_health_message;
++    GstClockTime first_healthy_running_time;
++    GstClockTime last_healthy_running_time;
+ } audio_renderer_t ;
+ static audio_renderer_t *renderer_type[NFORMATS];
+ static audio_renderer_t *renderer = NULL;
+@@ -126,6 +139,9 @@ bool gstreamer_init(){
+ }
+ 
+ void audio_renderer_init(logger_t *render_logger, const char* audiosink, const bool* audio_sync, const bool* video_sync, const char *artp_pipeline) {
++    g_rec_mutex_lock(&audio_lock);
++    /* Initialization is also safe after a previous instance was disposed. */
++    audio_renderer_destroy();
+     GError *error = NULL;
+     GstCaps *caps = NULL;
+     GstClock *clock = gst_system_clock_obtain();
+@@ -137,6 +153,11 @@ void audio_renderer_init(logger_t *render_logger, const char* audiosink, const b
+     }
+ 
+     logger = render_logger;
++    gst_audio_pipeline_base_time = GST_CLOCK_TIME_NONE;
++    render_audio = FALSE;
++    sync = FALSE;
++    stale_timestamp_count = 0;
++    last_stale_timestamp_log = 0;
+     
+     aac = check_plugin_feature (avdec_aac);
+     alac = check_plugin_feature (avdec_alac);
+@@ -234,23 +255,32 @@ void audio_renderer_init(logger_t *render_logger, const char* audiosink, const b
+         g_string_free(launch, TRUE);
+         g_object_set(renderer_type[i]->appsrc, "caps", caps, "stream-type", 0, "is-live", TRUE, "format", GST_FORMAT_TIME, NULL);
+         gst_caps_unref(caps);
+-        g_object_unref(clock);
+     }
++    /* Upstream c3137b6: gst_system_clock_obtain() above owns one reference. */
++    g_object_unref(clock);
++    logger_log(logger, LOGGER_INFO, "audio lifecycle initialized: formats=%d realtime-clock sync-config retained", NFORMATS);
++    g_rec_mutex_unlock(&audio_lock);
+ }
+ 
+ void audio_renderer_stop() {
++    g_rec_mutex_lock(&audio_lock);
+     if (renderer) {
+-        gst_app_src_end_of_stream(GST_APP_SRC(renderer->appsrc));
+         gst_element_set_state (renderer->pipeline, GST_STATE_NULL);
++        renderer->needs_reset = FALSE;
++        logger_log(logger, LOGGER_INFO, "audio lifecycle stopped: ct=%u", renderer->ct);
+         renderer = NULL;
+     }
++    render_audio = FALSE;
++    gst_audio_pipeline_base_time = GST_CLOCK_TIME_NONE;
++    stale_timestamp_count = 0;
++    g_rec_mutex_unlock(&audio_lock);
+ }
+ 
+ static void get_renderer_type(unsigned char *ct, int *id) {
+     render_audio = FALSE;
+     *id = -1;
+     for (int i = 0; i < NFORMATS; i++) {
+-        if (renderer_type[i]->ct == *ct) {
++        if (renderer_type[i] && renderer_type[i]->ct == *ct) {
+ 	    *id = i;
+             break;
+         }
+@@ -282,32 +312,92 @@ static void get_renderer_type(unsigned char *ct, int *id) {
+     }
+ }
+ 
+-void  audio_renderer_start(unsigned char *ct) {
++/* An explicit new stream/FLUSH establishes a fresh appsrc segment.
++ * READY clears previous EOS/queued media. GStreamer chooses the new realtime base;
++ * the video clock and the receiver's shared NTP mapping are deliberately untouched. */
++static gboolean audio_renderer_activate(const char *event) {
++    if (!renderer || !renderer->pipeline) return FALSE;
++    GstState state = GST_STATE_NULL, pending = GST_STATE_VOID_PENDING;
++    gst_audio_pipeline_base_time = GST_CLOCK_TIME_NONE;
++    gst_bus_set_flushing(renderer->bus, TRUE);
++    gst_element_set_state(renderer->pipeline, GST_STATE_READY);
++    gst_bus_set_flushing(renderer->bus, FALSE);
++    GstStateChangeReturn result = gst_element_set_state(renderer->pipeline, GST_STATE_PLAYING);
++    if (result != GST_STATE_CHANGE_FAILURE) {
++        gst_element_get_state(renderer->pipeline, &state, &pending, 150 * GST_MSECOND);
++        gst_audio_pipeline_base_time = gst_element_get_base_time(renderer->pipeline);
++    }
++    renderer->needs_reset = FALSE;
++    renderer->healthy_since = 0;
++    renderer->last_health_message = 0;
++    stale_timestamp_count = 0;
++    last_stale_timestamp_log = 0;
++    logger_log(logger, LOGGER_INFO,
++               "audio lifecycle %s: ct=%u state=%s pending=%s result=%d base_ns=%" G_GUINT64_FORMAT " sync=%d",
++               event, renderer->ct, gst_element_state_get_name(state), gst_element_state_get_name(pending),
++               result, gst_audio_pipeline_base_time, sync);
++    return result != GST_STATE_CHANGE_FAILURE;
++}
++
++void audio_renderer_start(unsigned char *ct) {
++    g_rec_mutex_lock(&audio_lock);
++    if (!ct) {
++        g_rec_mutex_unlock(&audio_lock);
++        return;
++    }
+     int id = -1;
+     get_renderer_type(ct, &id);
+-    if (id >= 0 && renderer) {
+-        if(*ct != renderer->ct) {
+-            gst_app_src_end_of_stream(GST_APP_SRC(renderer->appsrc));
+-            gst_element_set_state (renderer->pipeline, GST_STATE_NULL);
+-            logger_log(logger, LOGGER_INFO, "changed audio connection, format %s", format[id]);
+-            renderer = renderer_type[id];
+-            gst_element_set_state (renderer->pipeline, GST_STATE_PLAYING);
+-            gst_audio_pipeline_base_time = gst_element_get_base_time(renderer->appsrc);
++    if (id >= 0) {
++        gboolean same_renderer = renderer == renderer_type[id];
++        const char *event = same_renderer ? "same-format-reset" : "start";
++        if (renderer && renderer != renderer_type[id]) {
++            gst_element_set_state(renderer->pipeline, GST_STATE_NULL);
++            renderer->needs_reset = FALSE;
+         }
+-    } else if (id >= 0) {
+-        logger_log(logger, LOGGER_INFO, "start audio connection, format %s", format[id]);
+         renderer = renderer_type[id];
+-        gst_element_set_state (renderer->pipeline, GST_STATE_PLAYING);
+-        gst_audio_pipeline_base_time = gst_element_get_base_time(renderer->appsrc);
++        renderer->recovery_attempts = 0;
++        renderer->healthy_since = 0;
++        renderer->last_health_message = 0;
++        GstState state = GST_STATE_NULL, pending = GST_STATE_VOID_PENDING;
++        gst_element_get_state(renderer->pipeline, &state, &pending, 0);
++        if (same_renderer && !renderer->needs_reset && state == GST_STATE_PLAYING && pending == GST_STATE_VOID_PENDING) {
++            /* Repeated healthy SETUP must not flush audio or change its base. */
++            gst_audio_pipeline_base_time = gst_element_get_base_time(renderer->pipeline);
++            logger_log(logger, LOGGER_INFO, "audio lifecycle same-format-kept-playing: ct=%u base_ns=%" G_GUINT64_FORMAT,
++                       renderer->ct, gst_audio_pipeline_base_time);
++        } else if (same_renderer && !renderer->needs_reset && state == GST_STATE_PAUSED) {
++            /* Resume a live paused pipeline without discarding its decoder/segment. */
++            GstStateChangeReturn result = gst_element_set_state(renderer->pipeline, GST_STATE_PLAYING);
++            gst_element_get_state(renderer->pipeline, &state, &pending, 150 * GST_MSECOND);
++            gst_audio_pipeline_base_time = gst_element_get_base_time(renderer->pipeline);
++            if (result == GST_STATE_CHANGE_FAILURE) render_audio = FALSE;
++            logger_log(logger, LOGGER_INFO, "audio lifecycle same-format-resumed: ct=%u state=%s result=%d base_ns=%" G_GUINT64_FORMAT,
++                       renderer->ct, gst_element_state_get_name(state), result, gst_audio_pipeline_base_time);
++        } else if (!audio_renderer_activate(event)) {
++            render_audio = FALSE;
++        }
+     } else {
+         logger_log(logger, LOGGER_ERR, "unknown audio compression type ct = %d", *ct);
+     }
++    g_rec_mutex_unlock(&audio_lock);
+ }
+ 
+ void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned short *seqnum, uint64_t *ntp_time) {
++    g_rec_mutex_lock(&audio_lock);
+     GstBuffer *buffer = NULL;
+ 
+-    if (!render_audio) return;    /* do nothing unless render_audio == TRUE */
++    if (!render_audio || !renderer || !data || !data_len || *data_len <= 0 || !ntp_time) goto done;
++    if (renderer->needs_reset) {
++        /* A persistent sink error must not cause a reset/log on every packet. */
++        if (renderer->recovery_attempts >= 1) goto done;
++        renderer->recovery_attempts++;
++        if (!audio_renderer_activate("recover")) goto done;
++    }
++
++    /* GstPipeline may complete PLAYING asynchronously. Read its real base instead
++     * of retaining the previous segment's cached value. */
++    gst_audio_pipeline_base_time = gst_element_get_base_time(renderer->pipeline);
++    if (!GST_CLOCK_TIME_IS_VALID(gst_audio_pipeline_base_time)) goto done;
+ 
+     GstClockTime pts = (GstClockTime) *ntp_time ;    /* now in nsecs */
+     //GstClockTimeDiff latency = GST_CLOCK_DIFF(gst_element_get_current_clock_time (renderer->appsrc), pts);
+@@ -315,12 +405,22 @@ void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned s
+         if (pts >= gst_audio_pipeline_base_time) {
+             pts -= gst_audio_pipeline_base_time;
+         } else {
+-            logger_log(logger, LOGGER_ERR, "*** invalid ntp_time < gst_audio_pipeline_base_time\n%8.6f ntp_time\n%8.6f base_time",
+-                       ((double) *ntp_time) / SECOND_IN_NSECS, ((double) gst_audio_pipeline_base_time) / SECOND_IN_NSECS);
+-            return;
++            stale_timestamp_count++;
++            gint64 now = g_get_monotonic_time();
++            if (!last_stale_timestamp_log || now - last_stale_timestamp_log >= 5000000) {
++                logger_log(logger, LOGGER_INFO,
++                           "audio lifecycle stale-timestamp: skipped=%u delta_ns=%" G_GUINT64_FORMAT " base_ns=%" G_GUINT64_FORMAT,
++                           stale_timestamp_count, gst_audio_pipeline_base_time - pts, gst_audio_pipeline_base_time);
++                last_stale_timestamp_log = now;
++            }
++            goto done;
+         }
+     }
+-    if (data_len == 0 || renderer == NULL) return;
++    if (stale_timestamp_count) {
++        logger_log(logger, LOGGER_INFO, "audio lifecycle timestamps-resumed: skipped=%u", stale_timestamp_count);
++        stale_timestamp_count = 0;
++        last_stale_timestamp_log = 0;
++    }
+ 
+     /* all audio received seems to be either ct = 8 (AAC_ELD 44100/2 spf 460 ) AirPlay Mirror protocol *
+      * or ct = 2 (ALAC 44100/16/2 spf 352) AirPlay protocol.                                           *
+@@ -364,28 +464,48 @@ void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned s
+         break;
+     }
+     if (valid) {
+-        gst_app_src_push_buffer(GST_APP_SRC(renderer->appsrc), buffer);
++        GstFlowReturn flow = gst_app_src_push_buffer(GST_APP_SRC(renderer->appsrc), buffer);
++        if (flow == GST_FLOW_EOS || flow == GST_FLOW_FLUSHING || flow == GST_FLOW_ERROR) {
++            renderer->needs_reset = TRUE;
++            renderer->healthy_since = 0;
++            renderer->last_health_message = 0;
++            logger_log(logger, LOGGER_INFO, "audio lifecycle flow-reset-pending: flow=%s", gst_flow_get_name(flow));
++        }
+     } else {
++        gst_buffer_unref(buffer);
+         logger_log(logger, LOGGER_ERR, "*** ERROR invalid  audio frame (compression_type %d) skipped ", renderer->ct);
+-        logger_log(logger, LOGGER_ERR, "***       first byte of invalid frame was  0x%2.2x ", (unsigned int) data[0]);
+     }
++done:
++    g_rec_mutex_unlock(&audio_lock);
+ }
+ 
+ void audio_renderer_set_volume(double volume) {
++    g_rec_mutex_lock(&audio_lock);
+     if (!renderer) {
++       g_rec_mutex_unlock(&audio_lock);
+        return;
+     }
+     volume = (volume > 10.0) ? 10.0 : volume;
+     volume = (volume < 0.0) ? 0.0 : volume;
+     g_object_set(renderer->volume, "volume", volume, NULL);
++    g_rec_mutex_unlock(&audio_lock);
+ }
+ 
+ void audio_renderer_flush() {
++    g_rec_mutex_lock(&audio_lock);
++    if (renderer && render_audio) {
++        renderer->recovery_attempts = 0;
++        audio_renderer_activate("flush");
++    }
++    g_rec_mutex_unlock(&audio_lock);
+ }
+ 
+ void audio_renderer_destroy() {
++    g_rec_mutex_lock(&audio_lock);
+     audio_renderer_stop();
+     for (int i = 0; i < NFORMATS ; i++ ) {
++        if (!renderer_type[i]) continue;
++        gst_element_set_state(renderer_type[i]->pipeline, GST_STATE_NULL);
+         gst_object_unref (renderer_type[i]->bus);
+         renderer_type[i]->bus = NULL;
+         gst_object_unref (renderer_type[i]->volume);
+@@ -395,10 +515,60 @@ void audio_renderer_destroy() {
+         gst_object_unref (renderer_type[i]->pipeline);
+         renderer_type[i]->pipeline = NULL;
+         free(renderer_type[i]);
++        renderer_type[i] = NULL;
++    }
++    renderer = NULL;
++    render_audio = FALSE;
++    gst_audio_pipeline_base_time = GST_CLOCK_TIME_NONE;
++    g_rec_mutex_unlock(&audio_lock);
++}
++
++/* Re-arm one automatic recovery only after sustained downstream progress. A
++ * successful appsrc enqueue alone says nothing about decoder/sink health. */
++static void audio_renderer_observe_health(audio_renderer_t *active, GstMessage *message) {
++    const GstStructure *structure = gst_message_get_structure(message);
++    if (active != renderer || !active->recovery_attempts || active->needs_reset ||
++        !structure || !gst_structure_has_name(structure, "level")) return;
++    guint64 running_time = GST_CLOCK_TIME_NONE;
++    if (!gst_structure_get_uint64(structure, "running-time", &running_time) ||
++        !GST_CLOCK_TIME_IS_VALID(running_time)) return;
++    GstClockTime current_running_time = gst_element_get_current_running_time(active->pipeline);
++    if (!GST_CLOCK_TIME_IS_VALID(current_running_time) ||
++        running_time > current_running_time + GST_SECOND ||
++        (current_running_time > running_time && current_running_time - running_time > GST_SECOND)) {
++        active->healthy_since = 0;
++        active->last_health_message = 0;
++        return;
++    }
++    gint64 now = g_get_monotonic_time();
++    if (!active->healthy_since || now - active->last_health_message > 1000000 ||
++        running_time < active->last_healthy_running_time) {
++        active->healthy_since = now;
++        active->first_healthy_running_time = running_time;
++    }
++    active->last_health_message = now;
++    active->last_healthy_running_time = running_time;
++    if (now - active->healthy_since >= 3000000 &&
++        running_time - active->first_healthy_running_time >= 2 * GST_SECOND) {
++        active->recovery_attempts = 0;
++        active->healthy_since = 0;
++        logger_log(logger, LOGGER_INFO, "audio lifecycle recovery-budget-restored: downstream-health-ms=3000");
+     }
+ }
+ 
+ static gboolean gstreamer_audio_pipeline_bus_callback(GstBus *bus, GstMessage *message, void *loop) {
++    g_rec_mutex_lock(&audio_lock);
++    audio_renderer_t *event_renderer = NULL;
++    for (int i = 0; i < NFORMATS; i++) {
++        if (renderer_type[i] && renderer_type[i]->bus == bus) {
++            event_renderer = renderer_type[i];
++            break;
++        }
++    }
++    if (!event_renderer) {
++        g_rec_mutex_unlock(&audio_lock);
++        return TRUE;
++    }
+     switch (GST_MESSAGE_TYPE(message)) {
+     case GST_MESSAGE_ERROR: {
+         GError *err = NULL;
+@@ -407,19 +577,23 @@ static gboolean gstreamer_audio_pipeline_bus_callback(GstBus *bus, GstMessage *m
+         logger_log(logger, LOGGER_INFO, "GStreamer error (audio): %s %s", GST_MESSAGE_SRC_NAME(message),err->message);
+         g_error_free(err);
+         g_free(debug);
+-        if (renderer->appsrc) {
+-            gst_app_src_end_of_stream (GST_APP_SRC(renderer->appsrc));
+-        }
+-        gst_bus_set_flushing(bus, TRUE);
+-        gst_element_set_state (renderer->pipeline, GST_STATE_READY);
+-        g_main_loop_quit( (GMainLoop *) loop);
++        event_renderer->needs_reset = TRUE;
++        event_renderer->healthy_since = 0;
++        event_renderer->last_health_message = 0;
++        gst_element_set_state(event_renderer->pipeline, GST_STATE_READY);
++        if (event_renderer == renderer) gst_audio_pipeline_base_time = GST_CLOCK_TIME_NONE;
++        /* This is a local audio recovery. Quitting the shared receiver main loop
++         * would tear down the healthy video connection before recovery can run. */
+ 	break;
+     }
+     case GST_MESSAGE_EOS:
+         logger_log(logger, LOGGER_INFO, "GStreamer: End-Of-Stream (audio)");
++        event_renderer->needs_reset = TRUE;
++        event_renderer->healthy_since = 0;
++        event_renderer->last_health_message = 0;
+         break;
+     case GST_MESSAGE_ELEMENT:
+-      // many "level" messages may be sent
++        audio_renderer_observe_health(event_renderer, message);
+         break;
+     default:
+         /* unhandled message */
+@@ -427,11 +601,43 @@ static gboolean gstreamer_audio_pipeline_bus_callback(GstBus *bus, GstMessage *m
+                    GST_MESSAGE_SRC_NAME(message), GST_MESSAGE_TYPE_NAME(message));
+         break;
+     }
++    g_rec_mutex_unlock(&audio_lock);
+     return TRUE;
+ }
+ 
+ unsigned int audio_renderer_listen(void *loop, int id) {
+     g_assert(id >= 0 && id < NFORMATS);
++    if (!renderer_type[id]) return 0;
+     return (unsigned int) gst_bus_add_watch(renderer_type[id]->bus,(GstBusFunc)
+                                             gstreamer_audio_pipeline_bus_callback, (gpointer) loop); 
+ }
++
++#ifdef UXPLAY_AUDIO_LIFECYCLE_TESTS
++GstElement *audio_renderer_test_ref_pipeline(void) {
++    g_rec_mutex_lock(&audio_lock);
++    GstElement *pipeline = renderer ? gst_object_ref(renderer->pipeline) : NULL;
++    g_rec_mutex_unlock(&audio_lock);
++    return pipeline;
++}
++
++uint64_t audio_renderer_test_base_time(void) {
++    g_rec_mutex_lock(&audio_lock);
++    uint64_t base = gst_audio_pipeline_base_time;
++    g_rec_mutex_unlock(&audio_lock);
++    return base;
++}
++
++unsigned int audio_renderer_test_recovery_attempts(void) {
++    g_rec_mutex_lock(&audio_lock);
++    unsigned int attempts = renderer ? renderer->recovery_attempts : 0;
++    g_rec_mutex_unlock(&audio_lock);
++    return attempts;
++}
++
++bool audio_renderer_test_needs_reset(void) {
++    g_rec_mutex_lock(&audio_lock);
++    bool needs_reset = renderer && renderer->needs_reset;
++    g_rec_mutex_unlock(&audio_lock);
++    return needs_reset;
++}
++#endif
+diff --git a/renderers/audio_renderer.h b/renderers/audio_renderer.h
+index df31661..41f1c57 100644
+--- a/renderers/audio_renderer.h
++++ b/renderers/audio_renderer.h
+@@ -40,6 +40,14 @@ void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned s
+ void audio_renderer_set_volume(double volume);
+ void audio_renderer_flush();
+ void audio_renderer_destroy();
++#ifdef UXPLAY_AUDIO_LIFECYCLE_TESTS
++/* Offline-only inspection; absent from the release executable. */
++typedef struct _GstElement GstElement;
++GstElement *audio_renderer_test_ref_pipeline(void);
++uint64_t audio_renderer_test_base_time(void);
++unsigned int audio_renderer_test_recovery_attempts(void);
++bool audio_renderer_test_needs_reset(void);
++#endif
+ unsigned int audio_renderer_listen(void *loop, int id);
+ #ifdef __cplusplus
+ }
+diff --git a/renderers/video_renderer.c b/renderers/video_renderer.c
+index 6f4a5ff..9e03926 100644
+--- a/renderers/video_renderer.c
++++ b/renderers/video_renderer.c
+@@ -764,8 +764,10 @@ void video_renderer_destroy() {
+     for (int i = 0; i < n_renderers; i++) {
+         if (renderer_type[i]) {
+             video_renderer_destroy_instance(renderer_type[i]);
++            renderer_type[i] = NULL;
+         }
+     }
++    renderer = NULL;
+ }
+ 
+ static void get_stream_status_name(GstStreamStatusType type, char *name, size_t len) {
+@@ -1150,7 +1152,7 @@ void video_renderer_seek(float position) {
+     int pos_in_micros = (int) (position * SECOND_IN_MICROSECS);
+     gint64 seek_position = (gint64) (pos_in_micros * GST_USECOND);
+     /* don't seek to within 1  microsecond  of beginning or end of video */
+-    if (hls_duration < 2000) return;
++    if (!renderer || hls_duration < 2000) return;
+     seek_position =  seek_position < 1000 ? 1000 : seek_position;
+     seek_position =  seek_position > hls_duration  - 1000 ? hls_duration - 1000 : seek_position;
+     g_print("SCRUB: seek to %f secs =  %" GST_TIME_FORMAT ", duration = %" GST_TIME_FORMAT "\n", position,
+@@ -1174,7 +1176,7 @@ unsigned int video_renderer_listen(void *loop, int id) {
+ }
+ 
+ bool video_renderer_eos_watch() {
+-    if (hls_video && renderer->eos) {
++    if (hls_video && renderer && renderer->eos) {
+         renderer->eos = FALSE;
+ 	return true;
+     }
+diff --git a/uxplay.cpp b/uxplay.cpp
+index 65dd2fd..88aabe4 100644
+--- a/uxplay.cpp
++++ b/uxplay.cpp
+@@ -70,6 +70,7 @@
+ #include "lib/logger.h"
+ #include "lib/dnssd.h"
+ #include "lib/crypto.h"
++#include "lib/media_clock.h"
+ #include "renderers/video_renderer.h"
+ #include "renderers/audio_renderer.h"
+ #include "renderers/mux_renderer.h"
+@@ -161,7 +162,6 @@ static int nohold = 0;
+ static bool nofreeze = false;
+ static unsigned short raop_port;
+ static unsigned short airplay_port;
+-static uint64_t remote_clock_offset = 0;
+ static std::vector<std::string> allowed_clients;
+ static std::vector<std::string> blocked_clients;
+ static bool restrict_clients;
+@@ -2302,7 +2302,7 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
+             close_window = false;  // we already closed the window
+         }
+         preserve_connections = false; //we already closed all other connections
+-        remote_clock_offset = 0;
++        media_clock_reset();
+         relaunch_video = true;
+         break;
+     case RESET_TYPE_RTP_TO_HLS_TEARDOWN:
+@@ -2313,7 +2313,7 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
+         if (use_video) {
+             video_renderer_stop();
+         }
+-        remote_clock_offset = 0;
++        media_clock_reset();
+         relaunch_video = true;
+         break;
+     case RESET_TYPE_HLS_SHUTDOWN:
+@@ -2327,7 +2327,7 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
+         }
+         raop_remove_hls_connections(raop);
+         preserve_connections = true;
+-        remote_clock_offset = 0;
++        media_clock_reset();
+         relaunch_video = true;
+         break;
+     case RESET_TYPE_ON_VIDEO_PLAY:
+@@ -2398,7 +2398,7 @@ extern "C" void conn_destroy (void *cls) {
+     open_connections--;
+     LOGD("Open connections: %i", open_connections);
+     if (open_connections == 0) {
+-        remote_clock_offset = 0;
++        media_clock_reset();
+         if (use_audio) {
+             audio_renderer_stop();
+         }
+@@ -2465,30 +2465,27 @@ extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *
+         mux_renderer_push_audio(data->data, data->data_len, data->ntp_time_remote);
+     }
+     if (use_audio) {
+-        if (!remote_clock_offset) {
+-            uint64_t local_time = (data->ntp_time_local ? data->ntp_time_local : get_local_time());
+-            remote_clock_offset = local_time - data->ntp_time_remote;
+-        }
+-        data->ntp_time_remote = data->ntp_time_remote + remote_clock_offset;
++        uint64_t presentation_time = media_clock_map(data->ntp_time_remote, data->ntp_time_local,
++                                                     data->ntp_time_local ? 0 : get_local_time());
+         switch (data->ct) {
+         case 2:
+             /* for progress monitor (ALAC audio only) */
+             rtptime = data->rtp_time;
+             if (audio_delay_alac) {
+-                data->ntp_time_remote = (uint64_t) ((int64_t) data->ntp_time_remote + audio_delay_alac);
++                presentation_time = (uint64_t) ((int64_t) presentation_time + audio_delay_alac);
+             }
+             break;
+         case 4:
+         case 8:
+             monitor_progress =  false;
+             if (audio_delay_aac) {
+-                data->ntp_time_remote = (uint64_t) ((int64_t) data->ntp_time_remote + audio_delay_aac);
++                presentation_time = (uint64_t) ((int64_t) presentation_time + audio_delay_aac);
+             }
+             break;
+         default:
+             break;
+         }
+-        audio_renderer_render_buffer(data->data, &(data->data_len), &(data->seqnum), &(data->ntp_time_remote));
++        audio_renderer_render_buffer(data->data, &(data->data_len), &(data->seqnum), &presentation_time);
+     }
+ }
+ 
+@@ -2500,18 +2497,17 @@ extern "C" void video_process (void *cls, raop_ntp_t *ntp, video_decode_struct *
+         mux_renderer_push_video(data->data, data->data_len, data->ntp_time_remote);
+     }
+     if (use_video) {
+-        if (!remote_clock_offset) {
+-            uint64_t local_time = (data->ntp_time_local ? data->ntp_time_local : get_local_time());
+-            remote_clock_offset = local_time - data->ntp_time_remote;
+-        }
+         int count = 0;
+         uint64_t pts_mismatch = 0;
+         do {
+-            data->ntp_time_remote = data->ntp_time_remote + remote_clock_offset;
+-            pts_mismatch = video_renderer_render_buffer(data->data, &(data->data_len), &(data->nal_count), &(data->ntp_time_remote));
++            /* Retry from the original packet timestamps, applying each shared
++             * presentation correction once; never add an offset to a mutated PTS. */
++            uint64_t presentation_time = media_clock_map(data->ntp_time_remote, data->ntp_time_local,
++                                                         data->ntp_time_local ? 0 : get_local_time());
++            pts_mismatch = video_renderer_render_buffer(data->data, &(data->data_len), &(data->nal_count), &presentation_time);
+             if (pts_mismatch) {
+                 LOGI("adjust timestamps by %8.6f secs", (double) pts_mismatch / SECOND_IN_NSECS);
+-                remote_clock_offset += pts_mismatch;
++                media_clock_adjust(pts_mismatch);
+             }
+             count++;
+         } while (pts_mismatch && count < 10);

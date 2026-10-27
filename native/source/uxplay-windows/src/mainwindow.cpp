@@ -1,0 +1,668 @@
+#include "mainwindow.h"
+#include "airplayworker.h"
+#include "logviewer.h"
+#include "mdns_responder.hpp"
+#include <windows.h>
+#include <winsvc.h>
+#include <io.h>
+
+#include <QProcess>
+#include <QAction>
+#include <QApplication>
+#include <QCloseEvent>
+#include <QDesktopServices>
+#include <QDebug>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QLabel>
+#include <QMenu>
+#include <QMessageBox>
+#include <QPushButton>
+#include <QProcessEnvironment>
+#include <QSettings>
+#include <QStandardPaths>
+#include <QStyle>
+#include <QSystemTrayIcon>
+#include <QComboBox>
+#include <QTimer>
+#include <QUrl>
+#include <QVBoxLayout>
+#include <QTextStream>
+
+struct RenameData {
+    DWORD pid;
+    QString newTitle;
+};
+
+// Callback method that Windows calls for every opened window
+BOOL CALLBACK EnumWindowsProcRename(HWND hwnd, LPARAM lParam) {
+    RenameData *data = reinterpret_cast<RenameData*>(lParam);
+    DWORD windowPid;
+    GetWindowThreadProcessId(hwnd, &windowPid);
+
+    if (windowPid == data->pid) {
+        char windowTitle[512];
+        if (GetWindowTextA(hwnd, windowTitle, sizeof(windowTitle))) {
+            QString title = QString::fromLocal8Bit(windowTitle);
+            
+            if (title.contains("Direct") && title.contains("enderer")) {
+                qInfo("Found renderer window; updating its title.");
+                SetWindowTextW(hwnd, reinterpret_cast<const wchar_t*>(data->newTitle.utf16()));
+                return FALSE;
+            }
+        }
+    }
+    return TRUE;
+}
+
+MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
+    ensureSettingsFileExists();
+    setupTray();
+    setupUI();
+
+    // Bonjour improves device discovery, but the server can also run without it.
+    if (ensureBonjourServiceInstalled()) {
+        startServer();
+    } else {
+        if (!m_quitting) {
+            m_quitting = true;
+            QTimer::singleShot(0, qApp, &QCoreApplication::quit);
+        }
+        return;
+    }
+}
+
+MainWindow::~MainWindow() {
+    m_quitting = true;
+    stopServer();
+}
+
+QString MainWindow::userArgumentsPath() const {
+    QString appDataPath = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    return appDataPath + "/arguments.txt";
+}
+
+QString MainWindow::machineArgumentsPath() const {
+    QString programDataPath =
+        QProcessEnvironment::systemEnvironment().value("ProgramData");
+    if (programDataPath.isEmpty()) {
+        programDataPath = "C:/ProgramData";
+    }
+    return programDataPath + "/uxplay-windows/arguments.txt";
+}
+
+QString MainWindow::activeArgumentsPath() const {
+    QString machinePath = machineArgumentsPath();
+    if (QFile::exists(machinePath)) {
+        return machinePath;
+    }
+
+    return userArgumentsPath();
+}
+
+QString MainWindow::expandEnvironmentVariables(const QString &content) const {
+    QString expanded = content;
+    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+
+    for (const QString &key : env.keys()) {
+        expanded.replace("%" + key + "%", env.value(key), Qt::CaseInsensitive);
+    }
+
+    return expanded;
+}
+
+void MainWindow::ensureSettingsFileExists() {
+    if (QFile::exists(userArgumentsPath()) || QFile::exists(machineArgumentsPath())) {
+        return;
+    }
+
+    QFileInfo info(userArgumentsPath());
+    QDir().mkpath(info.absolutePath());
+
+    QFile file(userArgumentsPath());
+    if (file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        QTextStream out(&file);
+        out << "-n uxplay-windows -nh";
+        file.close();
+    }
+}
+
+QStringList MainWindow::getArgumentsFromFile() {
+    const QString userPath = userArgumentsPath();
+    const QString machinePath = machineArgumentsPath();
+    const QString selectedPath = activeArgumentsPath();
+
+    qInfo().noquote() << "[arguments] Machine file:"
+                      << QDir::toNativeSeparators(machinePath)
+                      << (QFile::exists(machinePath) ? "(found)" : "(not found)");
+    qInfo().noquote() << "[arguments] User file:"
+                      << QDir::toNativeSeparators(userPath)
+                      << (QFile::exists(userPath) ? "(found)" : "(not found)");
+    qInfo().noquote() << "[arguments] Reading:"
+                      << QDir::toNativeSeparators(selectedPath);
+
+    QFile file(selectedPath);
+    if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        QString content = expandEnvironmentVariables(QTextStream(&file).readAll().trimmed());
+        file.close();
+        return QProcess::splitCommand(content);
+    }
+
+    qWarning().noquote()
+        << "[arguments] Unable to read the selected file; using built-in defaults.";
+    return QStringList() << "-n" << "uxplay-windows" << "-nh";
+}
+
+void MainWindow::setupUI() {
+    setWindowTitle("uxplay-windows");
+    setWindowIcon(QApplication::windowIcon());
+    setFixedSize(320, 310);
+
+    auto *central = new QWidget(this);
+    setCentralWidget(central);
+    auto *layout = new QVBoxLayout(central);
+
+    m_statusLabel = new QLabel("Initializing...", this);
+    m_statusLabel->setAlignment(Qt::AlignCenter);
+    layout->addWidget(m_statusLabel);
+
+    // Bluetooth Discovery Checkbox
+    m_bleCheckbox = new QCheckBox("Enable Bluetooth Discovery", this);
+    QSettings settings;
+    m_bleCheckbox->setChecked(settings.value("ble_enabled", true).toBool());
+    connect(m_bleCheckbox, &QCheckBox::toggled, this, &MainWindow::toggleBle);
+    layout->addWidget(m_bleCheckbox);
+
+    m_autostartCheckbox = new QCheckBox("Open uxplay-windows at login", this);
+    m_autostartCheckbox->setChecked(isAutostartEnabled());
+    connect(m_autostartCheckbox, &QCheckBox::toggled,
+            this, &MainWindow::toggleAutostart);
+    layout->addWidget(m_autostartCheckbox);
+
+    // Force Fullscreen Checkbox
+    m_fullscreenCheckbox = new QCheckBox("Force Fullscreen (must select renderer)", this);
+    m_fullscreenCheckbox->setChecked(
+        settings.value("force_fs_enabled", false).toBool()
+    );
+    connect(m_fullscreenCheckbox, &QCheckBox::toggled, this,
+            &MainWindow::toggleForceFullscreen);
+    layout->addWidget(m_fullscreenCheckbox);
+
+    // Renderer dropdown
+    m_rendererCombo = new QComboBox(this);
+    m_rendererCombo->addItem("Video Renderer (Auto)", "auto");
+    m_rendererCombo->addItem("D3D11", "d3d11");
+    m_rendererCombo->addItem("D3D12", "d3d12");
+    m_rendererCombo->addItem("Audio Only", "audio-only");
+
+    {
+        QString saved = settings.value("renderer_mode", "auto").toString();
+        int idx = m_rendererCombo->findData(saved);
+        if (idx >= 0) m_rendererCombo->setCurrentIndex(idx);
+    }
+
+    connect(m_rendererCombo,
+            QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, &MainWindow::onRendererChanged);
+
+    layout->addWidget(m_rendererCombo);
+
+
+    m_settingsBtn = new QPushButton("Edit UxPlay Arguments (Advanced)", this);
+    connect(m_settingsBtn, &QPushButton::clicked, this, &MainWindow::openSettingsFile);
+    layout->addWidget(m_settingsBtn);
+
+    m_listargsBtn = new QPushButton("List UxPlay arguments", this);
+    connect(m_listargsBtn, &QPushButton::clicked, this, &MainWindow::openListArgsFile);
+    layout->addWidget(m_listargsBtn);
+
+    auto *logButton = new QPushButton("Open current log", this);
+    connect(logButton, &QPushButton::clicked, this, &MainWindow::openCurrentLog);
+    layout->addWidget(logButton);
+
+    m_licenseBtn = new QPushButton("License Information", this);
+    connect(m_licenseBtn, &QPushButton::clicked, this, &MainWindow::showLicense);
+    layout->addWidget(m_licenseBtn);
+
+    layout->addStretch();
+    updateStatus();
+}
+
+void MainWindow::openSettingsFile() {
+    QString filePath = activeArgumentsPath();
+    QDesktopServices::openUrl(QUrl::fromLocalFile(filePath));
+    
+    m_tray->showMessage("Settings", "Restart the app to apply new arguments.", 
+                        QSystemTrayIcon::Information, 3000);
+}
+
+void MainWindow::openListArgsFile() {
+    QString filePath = QApplication::applicationDirPath() + "/resources/uxplay_arguments_list.txt";
+    QFile::setPermissions(filePath, QFile::ReadOwner | QFile::ReadGroup | QFile::ReadOther);
+    QDesktopServices::openUrl(QUrl::fromLocalFile(filePath));
+}
+
+void MainWindow::openCurrentLog() {
+    const QString path = qApp->property("sessionLogPath").toString();
+    if (path.isEmpty()) {
+        QMessageBox::warning(this, "Logging unavailable", "No session log is available.");
+        return;
+    }
+    if (!m_logViewer) {
+        m_logViewer = new LogViewer(path, this);
+        m_logViewer->setAttribute(Qt::WA_DeleteOnClose);
+    }
+    m_logViewer->showNormal();
+    m_logViewer->raise();
+    m_logViewer->activateWindow();
+}
+
+void MainWindow::setupTray() {
+    m_tray = new QSystemTrayIcon(this);
+    QIcon trayIcon;
+    QString icoPath = QApplication::applicationDirPath() + "/resources/icon.ico";
+    trayIcon = QIcon(icoPath);
+    if (trayIcon.isNull()) {
+        trayIcon = QApplication::style()->standardIcon(QStyle::SP_MediaPlay);
+    }
+    m_tray->setIcon(trayIcon);
+    m_tray->setToolTip("uxplay-windows");
+
+    m_trayMenu = new QMenu(this);
+    m_trayMenu->addAction("Open current log", this, &MainWindow::openCurrentLog);
+    m_trayMenu->addAction("Quit", this, &MainWindow::quit);
+    m_trayMenu->addAction("Restart", this, &MainWindow::restartApplication);
+
+    m_tray->setContextMenu(m_trayMenu);
+    
+    connect(m_tray, &QSystemTrayIcon::activated, this, &MainWindow::onTrayActivated);
+    m_tray->show();
+}
+
+void MainWindow::onTrayActivated(QSystemTrayIcon::ActivationReason reason) {
+    if (reason == QSystemTrayIcon::Trigger) {
+        isVisible() ? hide() : showNormal();
+    }
+}
+
+void MainWindow::toggleBle(bool checked) {
+    QSettings settings;
+    
+    if (settings.value("ble_enabled").toBool() == checked) {
+        return;
+    }
+
+    settings.setValue("ble_enabled", checked);
+    
+    m_tray->showMessage("uxplay-windows", "Please restart the uxplay-windows to apply changes.\n(Right-click the Tray Icon)", 
+                        QSystemTrayIcon::Information, 3000);
+}
+
+void MainWindow::toggleForceFullscreen(bool checked) {
+    QSettings settings;
+    if (settings.value("force_fs_enabled").toBool() == checked) {
+        return;
+    }
+
+    settings.setValue("force_fs_enabled", checked);
+    m_tray->showMessage("uxplay-windows", "Please restart the uxplay-windows to apply changes.\n(Right-click the Tray Icon)", 
+                        QSystemTrayIcon::Information, 3000);
+}
+
+void MainWindow::onRendererChanged(int /*index*/) {
+    if (!m_rendererCombo) return;
+
+    QString mode = m_rendererCombo->currentData().toString();
+
+    QSettings settings;
+    QString saved = settings.value("renderer_mode", "auto").toString();
+    if (saved == mode) return;
+
+    settings.setValue("renderer_mode", mode);
+    m_tray->showMessage("uxplay-windows", "Please restart the uxplay-windows to apply changes.\n(Right-click the Tray Icon)", 
+                        QSystemTrayIcon::Information, 3000);
+}
+
+void MainWindow::applyRendererAndFullscreenArgs(QStringList &args) {
+    while (true) {
+        int idx = args.indexOf("-fs");
+        if (idx < 0) break;
+        args.removeAt(idx);
+    }
+    if (m_fullscreenCheckbox && m_fullscreenCheckbox->isChecked()) {
+        args << "-fs";
+    }
+
+    QString mode = "auto";
+    if (m_rendererCombo) {
+        mode = m_rendererCombo->currentData().toString();
+    }
+
+    if (mode == "auto") {
+        return;
+    }
+
+    // An explicitly selected GUI renderer overrides any -vs option from the
+    // arguments file. In Auto mode, keep the file's -vs option unchanged.
+    for (int i = 0; i < args.size();) {
+        if (args[i] == "-vs") {
+            args.removeAt(i);
+            if (i < args.size()) {
+                args.removeAt(i);
+            }
+            continue;
+        }
+        ++i;
+    }
+
+    if (mode == "d3d11") {
+        args << "-vs" << "d3d11videosink";
+    } else if (mode == "d3d12") {
+        args << "-vs" << "d3d12videosink";
+    } else if (mode == "audio-only") {
+        args << "-vs" << "0";
+    }
+}
+
+void MainWindow::startServer() {
+    if (m_worker && m_worker->isRunning()) return;
+
+    QString appData = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    QDir().mkpath(appData);
+    
+    QStringList args = getArgumentsFromFile();
+    
+    int bleIdx = args.indexOf("-ble");
+    if (bleIdx != -1) {
+        args.removeAt(bleIdx);
+        if (bleIdx < args.size() && !args[bleIdx].startsWith("-")) {
+            args.removeAt(bleIdx);
+        }
+    }
+
+    applyRendererAndFullscreenArgs(args);
+
+    // Only add -ble and start beacon if checkbox is checked
+    if (!m_bleCheckbox) return;
+    if (m_bleCheckbox->isChecked()) {
+        QString bleFilePath = QDir::toNativeSeparators(appData + "/uxplay_status.ble");
+        args << "-ble" << bleFilePath;
+        startBluetoothBeacon
+    (bleFilePath);
+    } else {
+        stopBluetoothBeacon();
+    }
+
+    m_worker = new AirPlayWorker(this);
+    m_worker->setArgs(args);
+
+    connect(m_worker, &AirPlayWorker::started, this, &MainWindow::onAirplayStarted);
+    connect(m_worker, &AirPlayWorker::stopped, this, &MainWindow::onAirplayStopped);
+    connect(m_worker, &AirPlayWorker::errorOccurred, this, &MainWindow::onAirplayError);
+    connect(m_worker, &AirPlayWorker::finished, m_worker.data(), &QObject::deleteLater);
+
+    m_worker->start();
+}
+
+void MainWindow::stopServer() {
+    stopBluetoothBeacon();
+    if (m_worker) {
+        m_worker->disconnect();
+        if (m_worker->isRunning()) {
+            QMetaObject::invokeMethod(m_worker.data(), &AirPlayWorker::stopAirplay, Qt::QueuedConnection);
+            if (!m_worker->wait(1000)) {
+                m_worker->terminate();
+            }
+        }
+        m_worker = nullptr;
+    }
+    m_running = false;
+    updateStatus();
+}
+
+
+void MainWindow::onAirplayStarted() {
+    m_running = true;
+    updateStatus();
+
+    qInfo("AirPlay server started.");
+
+    // Only explicitly selected Direct3D sinks are known to support Alt+Enter.
+    // Leave automatically selected GStreamer sink windows unchanged.
+    if (!m_rendererCombo ||
+        m_rendererCombo->currentData().toString() == "auto") {
+        return;
+    }
+
+    // Rename the video window when it pops up.
+    QTimer *monitorTimer = new QTimer(this);
+    connect(monitorTimer, &QTimer::timeout, this, [this, monitorTimer]() {
+        if (!m_running) {
+            monitorTimer->stop();
+            monitorTimer->deleteLater();
+            return;
+        }
+
+        RenameData info;
+        info.pid = GetCurrentProcessId();
+        info.newTitle = "AirPlay Video Stream (ALT+ENTER for Fullscreen)"; 
+
+        EnumWindows(EnumWindowsProcRename, reinterpret_cast<LPARAM>(&info));
+    });
+    monitorTimer->start(5000);
+
+}
+
+void MainWindow::onAirplayStopped() {
+    m_running = false;
+    updateStatus();
+    
+    if (!m_quitting) {
+        qDebug() << "Session ended, restarting server to stay ready...";
+        QTimer::singleShot(1000, this, &MainWindow::startServer);
+    }
+}
+
+void MainWindow::onAirplayError(const QString &message) {
+    qCritical().noquote() << message;
+    m_tray->showMessage("uxplay-windows", message, QSystemTrayIcon::Warning, 3000);
+}
+
+void MainWindow::toggleAutostart(bool checked) {
+    setAutostart(checked);
+    updateStatus();
+}
+
+bool MainWindow::isAutostartEnabled() const {
+    QSettings reg("HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", QSettings::NativeFormat);
+    return reg.contains("uxplay-windows");
+}
+
+void MainWindow::setAutostart(bool enabled) {
+    QSettings reg("HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", QSettings::NativeFormat);
+    if (enabled) {
+        QString path = QDir::toNativeSeparators(QApplication::applicationFilePath());
+        reg.setValue("uxplay-windows", "\"" + path + "\"");
+    } else {
+        reg.remove("uxplay-windows");
+    }
+}
+
+void MainWindow::startBluetoothBeacon(const QString &path) {
+    if (m_beacon && m_beacon->state() != QProcess::NotRunning)
+        return;
+
+    QString exe = QApplication::applicationDirPath() + "/uxplay-bluetooth-beacon.exe";
+    if (!QFile::exists(exe)) {
+        qDebug() << "uxplay-bluetooth-beacon.exe not found";
+        return;
+    }
+
+    m_beacon = new QProcess(this);
+    m_beaconOutput.clear();
+    m_beacon->setProcessChannelMode(QProcess::MergedChannels);
+
+    connect(m_beacon, &QProcess::readyRead, this, [this]() {
+        forwardBluetoothOutput();
+    });
+    connect(m_beacon, &QProcess::finished, this, [this](int, QProcess::ExitStatus) {
+        forwardBluetoothOutput(true);
+    });
+    connect(m_beacon, &QProcess::errorOccurred, this, [this](QProcess::ProcessError) {
+        qWarning().noquote() << "Bluetooth beacon:" << m_beacon->errorString();
+    });
+
+    // Pass the explicit path to the beacon file
+    m_beacon->start(exe, {"--path", path});
+    qDebug() << "Beacon process started watching:" << path;
+}
+
+void MainWindow::forwardBluetoothOutput(bool finished) {
+    // Reads can split lines or UTF-8 characters. Reassemble each line before
+    // writing so diagnostics from another source cannot land inside it.
+    m_beaconOutput += m_beacon->readAll();
+    qsizetype newline;
+    while ((newline = m_beaconOutput.indexOf('\n')) >= 0) {
+        _write(_fileno(stdout), m_beaconOutput.constData(), unsigned(newline + 1));
+        m_beaconOutput.remove(0, newline + 1);
+    }
+    if (finished && !m_beaconOutput.isEmpty()) {
+        m_beaconOutput += '\n';
+        _write(_fileno(stdout), m_beaconOutput.constData(), unsigned(m_beaconOutput.size()));
+        m_beaconOutput.clear();
+    }
+}
+
+void MainWindow::stopBluetoothBeacon() {
+    if (!m_beacon) return;
+    
+    qDebug() << "Stopping beacon process";
+    if (m_beacon->state() != QProcess::NotRunning) {
+        m_beacon->terminate();
+        if (!m_beacon->waitForFinished(500)) {
+            qDebug() << "Beacon didn't terminate, killing";
+            m_beacon->kill();
+            m_beacon->waitForFinished(100);
+        }
+    }
+    
+    delete m_beacon;
+    m_beacon = nullptr;
+    qDebug() << "Beacon stopped and cleaned up";
+}
+
+void MainWindow::showLicense() {
+    QString path = QApplication::applicationDirPath() + "/LICENSE.rtf";
+    if (QFile::exists(path)) {
+        QDesktopServices::openUrl(QUrl::fromLocalFile(path));
+    } else qDebug() << "License file not found:" << path;
+}
+
+void MainWindow::quit() {
+    m_quitting = true;
+    stopServer();
+    QApplication::quit();
+}
+
+void MainWindow::closeEvent(QCloseEvent *event) {
+    if (!m_quitting) {
+        hide();
+        event->ignore();
+    } else {
+        event->accept();
+    }
+}
+
+void MainWindow::updateStatus() {
+    QString status = m_running ? "UxPlay server running" : "UxPlay server stopped";
+    m_statusLabel->setText(status);
+    m_autostartCheckbox->setChecked(isAutostartEnabled());
+}
+
+bool MainWindow::isWindowsServicePresent(const std::wstring& serviceName) const {
+    SC_HANDLE hSCM = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!hSCM) return false;
+
+    SC_HANDLE hSvc = OpenServiceW(hSCM, serviceName.c_str(), SERVICE_QUERY_STATUS);
+    if (!hSvc) {
+        DWORD err = GetLastError();
+        CloseServiceHandle(hSCM);
+        return err != ERROR_SERVICE_DOES_NOT_EXIST;
+    }
+
+    CloseServiceHandle(hSvc);
+    CloseServiceHandle(hSCM);
+    return true;
+}
+
+bool MainWindow::ensureBonjourServiceInstalled() {
+    const std::wstring serviceName = L"Bonjour Service";
+
+    if (isWindowsServicePresent(serviceName)) {
+        return true;
+    }
+
+    int choice = QMessageBox::question(
+        this,
+        "Bonjour Service Not Installed",
+        "Bonjour Service is not installed. Installing it is recommended for "
+        "reliable AirPlay device discovery (mDNS).\n\n"
+        "Do you want to install it now?",
+        QMessageBox::Yes | QMessageBox::No,
+        QMessageBox::Yes
+    );
+
+    if (choice != QMessageBox::Yes) {
+        QMessageBox::warning(
+            this,
+            "Continuing Without Bonjour",
+            "You can continue without Bonjour, but the following conditions "
+            "must be met:\n\n"
+            "1. Both devices must be connected to the same local network.\n"
+            "2. Bluetooth must be enabled on both devices.\n"
+            "3. Bluetooth Discovery must remain enabled in uxplay-windows.\n\n"
+            "Without Bonjour, your devices may still be unable to find each other."
+        );
+        return true;
+    }
+
+    QMessageBox::information(
+        this,
+        "Installing Bonjour Service",
+        "Starting installation of 'Bonjour Service'. Follow any UAC prompt."
+    );
+
+    int rc = mdns::MdnsResponder::install();
+
+    // Re-check after install to be safe.
+    if (rc == 0 && isWindowsServicePresent(serviceName)) {
+        QMessageBox::information(
+            this,
+            "Installation Complete",
+            "Bonjour Service installed successfully.\nThe application will restart."
+        );
+        restartApplication();
+        return false; // do not start server in this instance
+    }
+
+    QMessageBox::critical(
+        this,
+        "Installation Failed",
+        "Failed to install 'Bonjour Service'.\n\n"
+        "The application will now exit."
+    );
+    return false;
+}
+
+void MainWindow::restartApplication() {
+    m_quitting = true;
+    stopServer();
+
+    // Let main() release the single-instance pipe before starting the
+    // replacement process. Starting it here would make it mistake this
+    // still-running process for the instance it should activate.
+    QTimer::singleShot(0, qApp, []() {
+        QCoreApplication::exit(MainWindow::RestartExitCode);
+    });
+}
